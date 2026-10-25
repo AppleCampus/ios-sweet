@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,923 @@
+@@ -0,0 +1,937 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -78,6 +78,8 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +					 * S1/bit11 feeds SE1, not SE0 */
 +#define HX_GCC_AHB0_BIT	(1u << 17)	/* wrap0 ahb branch (verified at runtime) */
 +#define HX_RCG_S0_CBCR	0x17030u	/* s0 branch CBCR; CMD +4, CFG +8 */
++#define HX_RCG_S0_CMD	0x17034u	/* UPDATE = bit 0 (clk-rcg2.c) */
++#define HX_RCG_S0_CFG	0x17038u	/* bit20 = DFS mode; src [10:8]; div low */
 +#define HX_GPIO_IO	0x4u
 +/* map one 4 KiB page per gpio (cfg +0, in/out +4, stride 0x1000) — even a
 + * 0.5 MiB span map busted kmem_alloc with KERN_NO_SPACE on this hardware */
@@ -844,6 +846,18 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	}
 +	printf("SWEET HMAX: clock settled s0 cbcr=%#x cfg=%#x\n",
 +	    rd(hx.gcc, HX_RCG_S0_CBCR), rd(hx.gcc, HX_RCG_S0_CBCR + 8u));
++	/* The S0 RCG is in DFS mode (cfg bit 20) with slot 0 unprogrammed:
++	 * no serial clock, so no m_cmd ever completes. Force a plain CXO/1
++	 * = 19.2 MHz config and strobe UPDATE. */
++	wr(hx.gcc, HX_RCG_S0_CFG, 0);
++	wr(hx.gcc, HX_RCG_S0_CMD, 1u);
++	if (!wait_clear(hx.gcc, HX_RCG_S0_CMD, 1u)) {
++		printf("SWEET HMAX: rcg update stuck\n");
++		sweet_log_flush_sync();
++		goto out;
++	}
++	printf("SWEET HMAX: rcg reprogrammed cfg=%#x\n",
++	    rd(hx.gcc, HX_RCG_S0_CFG));
 +	sweet_log_flush_sync();
 +	if (!se_init())
 +		goto out;

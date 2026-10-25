@@ -37,3 +37,36 @@ pm660l_l7 can be voted by cmd-db resource name.
 +			res ? res : "(null)", mv);
 +		return EINVAL;
 +	}
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -148,6 +172,30 @@
+ 	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
+ 		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
+ 		return EINVAL;
+ 	}
++	/* enumerate resource names so board bring-up can see the truth */
++	for (uint32_t e = RH_DB_HEADER, shown = 0;
++		    e + RH_DB_ENTRY <= rh_db_size && shown < 120;
++		    e += RH_DB_ENTRY) {
++		uint32_t key[2] = { rh_read(rh_db, e), rh_read(rh_db, e + 4) };
++		char nm[9];
++		if (!(key[0] | key[1])) {
++			continue;
++		}
++		for (unsigned i = 0; i < 8; ++i) {
++			nm[i] = (char)((key[i / 4] >> (8u * (i % 4))) & 0xffu);
++		}
++		nm[8] = 0;
++		for (unsigned i = 0; i < 8; ++i) {
++			if (nm[i] && (nm[i] < 0x20 || nm[i] > 0x7e)) {
++				nm[0] = 0;
++				break;
++			}
++		}
++		if (nm[0]) {
++			printf("SWEET RPMH: res %s\n", nm);
++			++shown;
++		}
++	}
+ 	return 0;
+ }

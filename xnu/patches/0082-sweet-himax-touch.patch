@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,757 @@
+@@ -0,0 +1,764 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -250,19 +250,23 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		return false;
 +	}
 +
-+	/* se_io_init + fifo mode (qcom-geni-se.c) */
++	/* se_io_init + fifo mode (qcom-geni-se.c) — one anchor per group:
++	 * a write here can kill the machine, and the anchor names the group */
 +	wr(hx.se, GENI_CGC_CTRL, rd(hx.se, GENI_CGC_CTRL) | 0x7fu);
 +	wr(hx.se, SE_DMA_GENERAL_CFG, rd(hx.se, SE_DMA_GENERAL_CFG) | 0x0fu);
 +	wr(hx.se, GENI_OUTPUT_CTRL, 0x7fu);
 +	wr(hx.se, GENI_FORCE_DEFAULT, 1u);
++	say("se cfg1 ok (cgc/dma/out/force)");
 +	wr(hx.se, SE_IRQ_EN, rd(hx.se, SE_IRQ_EN) | 0x0fu);
 +	wr(hx.se, SE_GSI_EVENT_EN, 0);
 +	wr(hx.se, SE_GENI_DMA_MODE_EN, rd(hx.se, SE_GENI_DMA_MODE_EN) & ~1u);
 +	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
 +	wr(hx.se, SE_S_IRQ_CLEAR, 0xffffffffu);
++	say("se cfg2 ok (irq en/clear)");
 +	wr(hx.se, SE_M_IRQ_EN, rd(hx.se, SE_M_IRQ_EN) | M_IRQ_COMMON |
 +	    M_CMD_DONE | M_RX_WM | M_RX_LAST | M_TX_WM);
 +	wr(hx.se, SE_S_IRQ_EN, rd(hx.se, SE_S_IRQ_EN) | M_CMD_DONE);
++	say("se cfg3 ok (m/s irq en)");
 +
 +	/* spi mode 0, 8 bpw, CS0, 9.6 MHz from the 19.2 MHz DFS level (idx 2) */
 +	wr(hx.se, SE_SPI_LOOPBACK, rd(hx.se, SE_SPI_LOOPBACK) & ~0x3u);
@@ -270,8 +274,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_SPI_CPHA, rd(hx.se, SE_SPI_CPHA) & ~1u);
 +	wr(hx.se, SE_SPI_CPOL, rd(hx.se, SE_SPI_CPOL) & ~0x4u);
 +	wr(hx.se, SE_SPI_DEMUX_OUTPUT_INV, 0);
++	say("se spi mode ok");
 +	wr(hx.se, SE_CLK_SEL, 2);
 +	wr(hx.se, SE_SER_M_CLK_CFG, (2u << 4) | 1u);
++	say("se clocks ok (clk_sel/ser)");
 +	/* 4 x 8-bit words per FIFO word, MSB-first on the wire */
 +	wr(hx.se, SE_GENI_TX_PACKING_CFG0, 0xc010u);
 +	wr(hx.se, SE_GENI_TX_PACKING_CFG1, 0x1c450u);
@@ -280,6 +286,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_GENI_BYTE_GRAN, 0);
 +	wr(hx.se, SE_SPI_WORD_LEN, (rd(hx.se, SE_SPI_WORD_LEN) & ~0x3ffu) | 4u);
 +	wr(hx.se, SE_SPI_DELAY_COUNTERS, 0);
++	say("se packing ok");
 +	return true;
 +}
 +

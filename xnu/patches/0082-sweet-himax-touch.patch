@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,697 @@
+@@ -0,0 +1,712 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -158,10 +158,9 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	int x[HX_MAX_PT], y[HX_MAX_PT];
 +} hx;
 +
-+/* the 64 KiB noflash image, generated from touch.h FW_19691_HX83112A_NF_DSJM */
-+static const uint8_t himax_fw_19691[65536] = {
++/* the 64 KiB noflash image, generated from touch.h FW_19691_HX83112A_NF_DSJM;
++ * the header carries its own static declaration (gen_fw_header.py output) */
 +#include "sweet_himax_fw_data.h"
-+};
 +
 +static uint32_t
 +rd(vm_offset_t base, uint32_t off)
@@ -201,18 +200,20 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +}
 +
 +static void
-+gpio_set(unsigned pin, bool north, unsigned pull, unsigned drive, bool out,
-+    bool val)
++gpio_set(unsigned pin, bool north, unsigned func, unsigned pull, unsigned drive,
++    bool out, bool val)
 +{
 +	vm_offset_t base = hx.tlmm + (north ? HX_TLMM_NORTH : HX_TLMM_SOUTH);
 +	uint32_t off = north ? HX_GPIO_N(pin) : HX_GPIO_S(pin);
 +	uint32_t cfg = rd(base, off);
 +	if (out) {
-+		/* latch before output enable: no glitch on the reset line */
-+		wr(base, off + HX_GPIO_IO, rd(base, off + HX_GPIO_IO) | (val ? 2u : 0u));
++		/* OUT register is +8 (IN is +4); latch before enabling output:
++		 * no glitch on the reset line */
++		wr(base, off + 8u, val ? (rd(base, off + 8u) | 1u) :
++		    (rd(base, off + 8u) & ~1u));
 +	}
 +	cfg &= ~0x3ffu;
-+	cfg |= (0u << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	cfg |= func | (pull << 2) | (drive << 6) | (out ? 0x200u : 0u);
 +	wr(base, off, cfg);
 +}
 +
@@ -389,17 +390,22 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	return m_cmd_wait_done() ? (got == len ? 0 : EIO) : EIO;
 +}
 +
++/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM
++ * image as ONE bus_write burst (himax_bus_write allocates 49152 bytes), and
++ * spi_tx splits it into FIFO chunks with CS held. Single driver thread, so
++ * one static buffer is fine. */
++static uint8_t hx_txbuf[2u + 4u + HX_48K_SZ + 16u];
++
 +static int
 +bus_write(uint8_t cmd, const uint8_t *data, unsigned len)
 +{
-+	uint8_t buf[512];
-+	if (hx.dead || 2u + len > sizeof(buf))
++	if (hx.dead || 2u + len > sizeof(hx_txbuf))
 +		return EIO;
-+	buf[0] = HX_WRITE_CMD;
-+	buf[1] = cmd;
++	hx_txbuf[0] = HX_WRITE_CMD;
++	hx_txbuf[1] = cmd;
 +	for (unsigned i = 0; i < len; ++i)
-+		buf[2 + i] = data[i];
-+	return spi_tx(buf, 2u + len);
++		hx_txbuf[2 + i] = data[i];
++	return spi_tx(hx_txbuf, 2u + len);
 +}
 +
 +/* ---- Himax AHB layer (vendor hx83112a_noflash.c logic, verbatim) ---- */
@@ -427,8 +433,13 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +static void
 +register_write(uint32_t addr, const uint8_t *data, unsigned len)
 +{
++	uint8_t buf[4 + MAX_TRANS_SZ];
++	buf[0] = addr & 0xff; buf[1] = (addr >> 8) & 0xff;
++	buf[2] = (addr >> 16) & 0xff; buf[3] = (addr >> 24) & 0xff;
++	for (unsigned i = 0; i < len && i < MAX_TRANS_SZ; ++i)
++		buf[4 + i] = data[i];
 +	burst_enable(len > 4 ? 1 : 0);
-+	flash_write_burst(addr, data, len);
++	(void)bus_write(0x00, buf, 4u + len);
 +}
 +
 +static void
@@ -487,22 +498,21 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	return 0xffffffffu;
 +}
 +
++/* the vendor writes each SRAM region (incl. the full 48 KiB image) as ONE
++ * flash_write_burst_length burst: addr prefix + payload, auto-increment on */
++static uint8_t hx_sram[4u + HX_48K_SZ];
++
 +static void
 +write_sram_0f(uint32_t dest, unsigned src_off, unsigned len)
 +{
-+	uint8_t chunk[MAX_TRANS_SZ];
-+	unsigned pos = 0;
++	hx_sram[0] = dest & 0xff;
++	hx_sram[1] = (dest >> 8) & 0xff;
++	hx_sram[2] = (dest >> 16) & 0xff;
++	hx_sram[3] = (dest >> 24) & 0xff;
++	for (unsigned i = 0; i < len; ++i)
++		hx_sram[4 + i] = himax_fw_19691[src_off + i];
 +	burst_enable(1);
-+	while (pos < len) {
-+		unsigned n = len - pos;
-+		if (n > MAX_TRANS_SZ)
-+			n = MAX_TRANS_SZ;
-+		for (unsigned i = 0; i < n; ++i)
-+			chunk[i] = himax_fw_19691[src_off + pos + i];
-+		flash_write_burst(dest + pos, chunk, n);
-+		pos += n;
-+		hx_wait(1);
-+	}
++	(void)bus_write(0x00, hx_sram, 4u + len);
 +}
 +
 +static bool
@@ -543,6 +553,8 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +{
 +	uint8_t zero[4] = { 0, 0, 0, 0 };
 +	uint8_t r55[4] = { 0x55, 0, 0, 0 };
++	interface_on();				/* vendor sense_on leads
++						 * with the burst handshake */
 +	flash_write_burst(0x9000005cu, zero, 4);
 +	register_write(0x90000018u, r55, 4);	/* AHBI2C system reset */
 +}
@@ -573,7 +585,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	write_sram_0f(0x10006A00u, 0xD640u, 1200u);
 +	write_sram_0f(0x10007B28u, 0xD320u, 800u);
 +	write_sram_0f(0x10007500u, 0xE000u, 1536u);
-+	write_sram_0f(0x10007294u, 0xC33Cu, 4u);	/* mode switch: poweron */
++	write_sram_0f(0x10007294u, 0xC30Cu, 4u);	/* mode switch: poweron
++							 * (0xC30C: the <=64K
++							 * path; 0xC33C is the
++							 * >64K bin path) */
 +
 +	/* disable flash reload, verify readback (vendor hx_dis_rload_0f) */
 +	uint8_t dr[4] = { 0xa9, 0x9a, 0x00, 0x00 };
@@ -585,7 +600,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	hx_wait(10);
 +	register_read(0x10007014u, d4, 4);		/* FW ID */
 +	printf("SWEET HMAX: fw id = %02x%02x%02x%02x (want ea159003)\n",
-+	    d4[3], d4[2], d4[1], d4[0]);
++	    d4[0], d4[1], d4[2], d4[3]);
 +	hx_wait(10);
 +	sense_on();
 +	hx_wait(10);
@@ -645,7 +660,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	    HX_GCC_S1_BIT | HX_GCC_AHB0_BIT);
 +	printf("SWEET HMAX: vote=%#x cbcr=%#x rcgcfg=%#x dfs=%#x\n",
 +	    rd(hx.gcc, HX_GCC_VOTE), rd(hx.gcc, HX_RCG_CBCR),
-+	    rd(hx.gcc, HX_RCG_CMD + 4u), rd(hx.gcc, HX_RCG_CMD + 0x14u));
++	    rd(hx.gcc, HX_RCG_CBCR + 0x8u), rd(hx.gcc, HX_RCG_CBCR + 0x14u));
 +	if (!wait_clear(hx.gcc, HX_RCG_CBCR, 1u)) {
 +		printf("SWEET HMAX: RCG halt timeout; clock integration needed\n");
 +		goto out;
@@ -655,14 +670,14 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +
 +	/* pins: qup0 mux=1 on gpio0-3 (SOUTH); reset 99 out; irq 125 in, pull-up */
 +	for (unsigned p = 0; p < 4; ++p)
-+		gpio_set(p, false, 0, 2, false, false);
-+	gpio_set(99, true, 0, 2, true, true);		/* reset high */
-+	gpio_set(125, true, 3, 3, false, false);	/* irq input, pull-up */
++		gpio_set(p, false, 1, 0, 2, false, false);
++	gpio_set(99, true, 0, 0, 2, true, true);	/* reset high */
++	gpio_set(125, true, 0, 3, 3, false, false);	/* irq input, pull-up */
 +	hx_wait(50);
 +	/* hardware reset pulse: low 2 ms, high 2 ms (vendor resetgpio_set) */
-+	gpio_set(99, true, 0, 2, true, false);
++	gpio_set(99, true, 0, 0, 2, true, false);
 +	hx_wait(2);
-+	gpio_set(99, true, 0, 2, true, true);
++	gpio_set(99, true, 0, 0, 2, true, true);
 +	hx_wait(2);
 +
 +	if (!fw_download()) {

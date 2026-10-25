@@ -913,7 +913,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	{
 +		/* cmd-db resource names are ldo<pmic-index-letter><n> (the
 +		 * sirius board votes "ldoc11"); pm660=a, pm660l=b here */
-+		int r7 = sweet_rpmh_vreg_enable("ldob7", 3100);
++		int r7 = sweet_rpmh_vreg_enable("ldob7", 3088);
 +		int r13 = sweet_rpmh_vreg_enable("ldoa13", 1800);
 +		int r14 = sweet_rpmh_vreg_enable("ldoa14", 1800);
 +		printf("SWEET HMAX: vreg ldob7=%d ldoa13=%d ldoa14=%d\n",

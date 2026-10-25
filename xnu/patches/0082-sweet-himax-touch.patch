@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,816 @@
+@@ -0,0 +1,923 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -136,7 +136,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#define IRQ_ERR_BITS		0x0eu
 +
 +#define OP_TX_ONLY		1u
++#define OP_RX_ONLY		2u
 +#define OP_FULL_DUPLEX		3u
++#define PARAM_FRAG		(1u << 2)
++#define TX_FIFO_WC		0x0fffffffu	/* GENI_TX_FIFO_STATUS word count */
 +
 +/* ---- Himax protocol ---- */
 +#define HX_READ_CMD		0xF3u
@@ -275,14 +278,15 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_S_IRQ_EN, rd(hx.se, SE_S_IRQ_EN) | M_CMD_DONE);
 +	say("se cfg3 ok (m/s irq en)");
 +
-+	/* spi mode 3 (vendor: ts->s_client->mode = SPI_MODE_3 — CPHA bit0,
-+	 * CPOL bit2), 8 bpw, CS0; SE_CLK_SEL 0 = CXO/2 9.6 MHz per the S0 RCG */
++	/* spi mode 0 for this stage: mode 3 (vendor's SPI_MODE_3) STALLS the
++	 * sequencer — commands are accepted and never complete. Revisit once
++	 * the bus is otherwise proven. */
 +	wr(hx.se, SE_SPI_LOOPBACK, rd(hx.se, SE_SPI_LOOPBACK) & ~0x3u);
 +	wr(hx.se, SE_SPI_DEMUX_SEL, 0);
-+	wr(hx.se, SE_SPI_CPHA, rd(hx.se, SE_SPI_CPHA) | 1u);
-+	wr(hx.se, SE_SPI_CPOL, rd(hx.se, SE_SPI_CPOL) | 0x4u);
++	wr(hx.se, SE_SPI_CPHA, rd(hx.se, SE_SPI_CPHA) & ~1u);
++	wr(hx.se, SE_SPI_CPOL, rd(hx.se, SE_SPI_CPOL) & ~0x4u);
 +	wr(hx.se, SE_SPI_DEMUX_OUTPUT_INV, 0);
-+	say("se spi mode ok (mode3)");
++	say("se spi mode ok (mode0 probe)");
 +	say("se: writing clk_sel/ser");
 +	wr(hx.se, SE_CLK_SEL, 0);
 +	wr(hx.se, SE_SER_M_CLK_CFG, (2u << 4) | 1u);
@@ -390,13 +394,25 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 + * bytes, so the first three captured bytes are discarded. */
 +static uint8_t hx_rxbuf[3u + HX_EVENT_FRAME + 4u];
 +
++static bool hx_use_fd;
++
++/* un-wedge the bus after a failed command: cancel/abort/clear and revive */
++static void
++bus_reset(void)
++{
++	wr(hx.se, SE_M_CMD_CTRL, M_CMD_CANCEL);
++	hx_wait(2);
++	wr(hx.se, SE_M_CMD_CTRL, M_CMD_ABORT);
++	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	hx.dead = false;
++}
++
 +/*
-+ * Himax bus read as ONE full-duplex command: [F3, addr, 00] + len pad bytes
-+ * clocked out while len+3 bytes are captured. CS low throughout, no
-+ * fragmentation, M_CMD_DONE fires when TRANS_LEN bytes are done.
++ * Full-duplex read: [F3, addr, 00] + len pad bytes out while len+3 bytes
++ * are captured; the first three captured bytes are discarded.
 + */
 +static int
-+bus_read(uint8_t cmd, uint8_t *data, unsigned len)
++fd_read(uint8_t cmd, uint8_t *data, unsigned len)
 +{
 +	unsigned total = 3u + len;
 +	unsigned got = 0;
@@ -440,6 +456,81 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	for (unsigned i = 0; i < len; ++i)
 +		data[i] = hx_rxbuf[3 + i];
 +	return 0;
++}
++
++/*
++ * Fragmented-chain read (the vendor message shape): a FRAG-marked TX-only
++ * command of [F3, addr, 00] (one word pushed, TRANS_LEN=3) holds CS low and
++ * does NOT raise DONE; the RX-only continuation ends the chain. wc prints
++ * reveal whether the engine consumes bytes or whole words.
++ */
++static int
++frag_read(uint8_t cmd, uint8_t *data, unsigned len)
++{
++	unsigned got = 0;
++
++	if (hx.dead || len == 0 || len > HX_EVENT_FRAME)
++		return EIO;
++	if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
++		hx.dead = true;
++		return EBUSY;
++	}
++	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
++	wr(hx.se, SE_SPI_TX_TRANS_LEN, 3);
++	{
++		uint32_t word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
++		wr(hx.se, SE_TX_FIFO, word);
++	}
++	wr(hx.se, SE_M_CMD, (OP_TX_ONLY << 27) | PARAM_FRAG);
++	if (!wait_clear(hx.se, SE_TX_FIFO_STATUS, TX_FIFO_WC)) {
++		printf("SWEET HMAX: frag tx drain timeout wc=%#x\n",
++		    rd(hx.se, SE_TX_FIFO_STATUS));
++		sweet_log_flush_sync();
++		hx.dead = true;
++		return EIO;
++	}
++	printf("SWEET HMAX: frag tx drained wc=%#x\n",
++	    rd(hx.se, SE_TX_FIFO_STATUS));
++	sweet_log_flush_sync();
++	delay(10);	/* last bits shift out */
++	wr(hx.se, SE_SPI_RX_TRANS_LEN, len);
++	wr(hx.se, SE_M_CMD, OP_RX_ONLY << 27);
++	for (unsigned i = 0; i < 30000 && got < len; ++i) {
++		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
++		unsigned wc = rd(hx.se, SE_RX_FIFO_STATUS) & RX_FIFO_WC_MSK;
++		for (unsigned k = 0; k < wc && got < len; ++k) {
++			uint32_t word = rd(hx.se, SE_RX_FIFO);
++			for (unsigned j = 0; j < 4 && got < len; ++j)
++				data[got++] = (uint8_t)(word >> (8u * j));
++		}
++		if (got >= len)
++			break;
++		if (irq & IRQ_ERR_BITS) {
++			wr(hx.se, SE_M_IRQ_CLEAR, irq);
++			printf("SWEET HMAX: frag rx irq err=%#x (got %u/%u)\n",
++			    irq, got, len);
++			sweet_log_flush_sync();
++			hx.dead = true;
++			return EIO;
++		}
++		if (irq & (M_RX_WM | M_RX_LAST))
++			wr(hx.se, SE_M_IRQ_CLEAR, irq & (M_RX_WM | M_RX_LAST));
++		delay(1);
++	}
++	if (!m_cmd_wait_done()) {
++		printf("SWEET HMAX: frag rx phase failed (got %u/%u)\n",
++		    got, len);
++		sweet_log_flush_sync();
++		return EIO;
++	}
++	return got == len ? 0 : EIO;
++}
++
++static int
++bus_read(uint8_t cmd, uint8_t *data, unsigned len)
++{
++	return hx_use_fd ? fd_read(cmd, data, len) : frag_read(cmd, data, len);
 +}
 +
 +/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM
@@ -777,6 +868,22 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		register_write(ZF_ADDR_SYS_RESET, r55, 4);
 +	}
 +	say("sys reset done");
++	/* probe A: full-duplex read; on a stall fall back to the fragmented
++	 * chain read for the rest of this boot */
++	say("probe: fd read");
++	hx_use_fd = true;
++	{
++		uint8_t chk[4] = { 0 };
++		if (bus_read(0x08, chk, 4) == 0) {
++			printf("SWEET HMAX: fd read ok d=%02x%02x%02x%02x\n",
++			    chk[0], chk[1], chk[2], chk[3]);
++		} else {
++			printf("SWEET HMAX: fd read failed -> frag fallback\n");
++			bus_reset();
++			hx_use_fd = false;
++		}
++		sweet_log_flush_sync();
++	}
 +	/* bus-alive probe: burst enable + readback (vendor himax_interface_on);
 +	 * the chk values prove whether the IC answers at all */
 +	interface_on();

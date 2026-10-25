@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,770 @@
+@@ -0,0 +1,775 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -73,9 +73,11 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#define HX_TLMM_SOUTH	0x00900000u	/* gpio 0-3 (SE0 pins) live here */
 +#define HX_TLMM_NORTH	0x00500000u	/* gpio 99 (reset), 125 (irq) */
 +#define HX_GCC_VOTE	0x5200cu
-+#define HX_GCC_S1_BIT	(1u << 11)	/* gcc_qupv3_wrap0_s1_clk (gcc-sdm845.c) */
++#define HX_GCC_S0_BIT	(1u << 10)	/* gcc_qupv3_wrap0_s0_clk: SE0's serial
++					 * clock (halt 0x17030, gcc-sdm845.c);
++					 * S1/bit11 feeds SE1, not SE0 */
 +#define HX_GCC_AHB0_BIT	(1u << 17)	/* wrap0 ahb branch (verified at runtime) */
-+#define HX_RCG_CBCR	0x17160u
++#define HX_RCG_S0_CBCR	0x17030u	/* s0 branch CBCR; CMD +4, CFG +8 */
 +#define HX_GPIO_IO	0x4u
 +/* map one 4 KiB page per gpio (cfg +0, in/out +4, stride 0x1000) — even a
 + * 0.5 MiB span map busted kmem_alloc with KERN_NO_SPACE on this hardware */
@@ -273,7 +275,8 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_S_IRQ_EN, rd(hx.se, SE_S_IRQ_EN) | M_CMD_DONE);
 +	say("se cfg3 ok (m/s irq en)");
 +
-+	/* spi mode 0, 8 bpw, CS0, 9.6 MHz from the 19.2 MHz DFS level (idx 2) */
++	/* spi mode 0, 8 bpw, CS0; SE_CLK_SEL 0 = DFS slot 0 = CXO 19.2 MHz
++	 * (ftbl first entry) — slot 2 was an unbacked guess */
 +	wr(hx.se, SE_SPI_LOOPBACK, rd(hx.se, SE_SPI_LOOPBACK) & ~0x3u);
 +	wr(hx.se, SE_SPI_DEMUX_SEL, 0);
 +	wr(hx.se, SE_SPI_CPHA, rd(hx.se, SE_SPI_CPHA) & ~1u);
@@ -281,7 +284,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_SPI_DEMUX_OUTPUT_INV, 0);
 +	say("se spi mode ok");
 +	say("se: writing clk_sel/ser");
-+	wr(hx.se, SE_CLK_SEL, 2);
++	wr(hx.se, SE_CLK_SEL, 0);
 +	wr(hx.se, SE_SER_M_CLK_CFG, (2u << 4) | 1u);
 +	say("se clocks ok (clk_sel/ser)");
 +	/* 4 x 8-bit words per FIFO word, MSB-first on the wire */
@@ -701,21 +704,23 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		goto out;
 +	}
 +	say("maps ok");
-+	/* clocks: vote wrap0_s1 + wrap0 ahb, verify the RCG comes out of halt */
++	/* clocks: vote SE0's serial clock (wrap0 S0) + wrap0 ahb. The first
++	 * bring-up voted S1 by mistake and the FORCE_DEFAULT write then died
++	 * on a dead core clock */
 +	wr(hx.gcc, HX_GCC_VOTE, rd(hx.gcc, HX_GCC_VOTE) |
-+	    HX_GCC_S1_BIT | HX_GCC_AHB0_BIT);
-+	printf("SWEET HMAX: vote=%#x cbcr=%#x rcgcfg=%#x dfs=%#x\n",
-+	    rd(hx.gcc, HX_GCC_VOTE), rd(hx.gcc, HX_RCG_CBCR),
-+	    rd(hx.gcc, HX_RCG_CBCR + 0x8u), rd(hx.gcc, HX_RCG_CBCR + 0x14u));
-+	/* branch CBCR CLK_OFF is bit 31 (clk-branch.c BRANCH_HALT); bit 0 is
-+	 * not the halt flag — the first settle check polled the wrong bit */
-+	if (!wait_clear(hx.gcc, HX_RCG_CBCR, 1u << 31)) {
++	    HX_GCC_S0_BIT | HX_GCC_AHB0_BIT);
++	printf("SWEET HMAX: vote=%#x s0 cbcr=%#x cmd=%#x cfg=%#x\n",
++	    rd(hx.gcc, HX_GCC_VOTE), rd(hx.gcc, HX_RCG_S0_CBCR),
++	    rd(hx.gcc, HX_RCG_S0_CBCR + 4u), rd(hx.gcc, HX_RCG_S0_CBCR + 8u));
++	/* branch CBCR CLK_OFF is bit 31 (clk-branch.c BRANCH_HALT) */
++	if (!wait_clear(hx.gcc, HX_RCG_S0_CBCR, 1u << 31)) {
 +		printf("SWEET HMAX: RCG halt timeout (cbcr=%#x)\n",
-+		    rd(hx.gcc, HX_RCG_CBCR));
++		    rd(hx.gcc, HX_RCG_S0_CBCR));
 +		sweet_log_flush_sync();
 +		goto out;
 +	}
-+	printf("SWEET HMAX: clock settled cbcr=%#x\n", rd(hx.gcc, HX_RCG_CBCR));
++	printf("SWEET HMAX: clock settled s0 cbcr=%#x cfg=%#x\n",
++	    rd(hx.gcc, HX_RCG_S0_CBCR), rd(hx.gcc, HX_RCG_S0_CBCR + 8u));
 +	sweet_log_flush_sync();
 +	if (!se_init())
 +		goto out;

@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,744 @@
+@@ -0,0 +1,757 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -63,6 +63,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_log_flush_sync(void);	/* bsd/dev/sweet_ufs.c */
 +void sweet_himax_init(void);
 +
 +/* ---- board facts (RMX1971 live FDT + pinctrl-sdm670.c) ---- */
@@ -159,6 +160,16 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	int x[HX_MAX_PT], y[HX_MAX_PT];
 +} hx;
 +
++/* Bring-up anchors must reach the persistent log even if the kernel dies a
++ * moment later: print, then flush the console ring to UFS synchronously
++ * (the periodic flush thread stops on its first write error). */
++static void
++say(const char *s)
++{
++	printf("SWEET HMAX: %s\n", s);
++	sweet_log_flush_sync();
++}
++
 +/* the 64 KiB noflash image, generated from touch.h FW_19691_HX83112A_NF_DSJM;
 + * the header carries its own static declaration (gen_fw_header.py output) */
 +#include "sweet_himax_fw_data.h"
@@ -232,8 +243,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	hx.fifodepth = (rd(hx.se, SE_HW_PARAM_0) >> 16) & 0x3fu;
 +	printf("SWEET HMAX: se fw=%#x proto=%u fifodepth=%u\n",
 +	    rev, (rev >> 8) & 0xffu, hx.fifodepth);
++	sweet_log_flush_sync();
 +	if (((rev >> 8) & 0xffu) != 1u) {
 +		printf("SWEET HMAX: SE is not SPI; abort\n");
++		sweet_log_flush_sync();
 +		return false;
 +	}
 +
@@ -567,27 +580,27 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	uint8_t reset55[4] = { 0x55, 0, 0, 0 };
 +
 +	register_write(ZF_ADDR_SYS_RESET, reset55, 4);
-+	printf("SWEET HMAX: sys reset done\n");
-+	printf("SWEET HMAX: step: enter safe mode\n");
-+	hx_wait(1500);
++	say("sys reset done");
++	say("step: enter safe mode");
 +	if (!enter_safe_mode()) {
 +		printf("SWEET HMAX: safe mode failed\n");
++		sweet_log_flush_sync();
 +		return false;
 +	}
-+	printf("SWEET HMAX: safe mode ok\n");
-+	printf("SWEET HMAX: step: 48k image + CRC\n");
-+	hx_wait(1500);
++	say("safe mode ok");
++	say("step: 48k image + CRC");
 +	for (unsigned retry = 0; retry < 10 && crc != 0; ++retry) {
 +		write_sram_0f(ZF_DATA_SRAM_START, 0, HX_48K_SZ);
 +		crc = hw_check_crc(ZF_DATA_SRAM_START, HX_48K_SZ);
-+		if (crc != 0)
++		if (crc != 0) {
 +			printf("SWEET HMAX: 48k CRC fail (%#x) retry %u\n", crc, retry);
++			sweet_log_flush_sync();
++		}
 +	}
 +	if (crc != 0)
 +		return false;
-+	printf("SWEET HMAX: 48k crc ok\n");
-+	printf("SWEET HMAX: step: config tables\n");
-+	hx_wait(1500);
++	say("48k crc ok");
++	say("step: config tables");
 +	write_sram_0f(0x10007000u, 0xC000u, 128u);
 +	write_sram_0f(0x10007084u, 0xC100u, 528u);
 +	write_sram_0f(0x10007300u, 0xCA00u, 128u);
@@ -598,23 +611,24 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +							 * (0xC30C: the <=64K
 +							 * path; 0xC33C is the
 +							 * >64K bin path) */
-+	printf("SWEET HMAX: tables written\n");
-+	printf("SWEET HMAX: step: dis reload + fw id\n");
-+	hx_wait(1500);
++	say("tables written");
++	say("step: dis reload + fw id");
 +
 +	/* disable flash reload, verify readback (vendor hx_dis_rload_0f) */
 +	uint8_t dr[4] = { 0xa9, 0x9a, 0x00, 0x00 };
 +	flash_write_burst(ZF_ADDR_DIS_RELOAD, dr, 4);
 +	register_read(ZF_ADDR_DIS_RELOAD, d4, 4);
-+	if (d4[3] || d4[2] || d4[1] != 0x9au || d4[0] != 0xa9u)
++	if (d4[3] || d4[2] || d4[1] != 0x9au || d4[0] != 0xa9u) {
 +		printf("SWEET HMAX: reload verify=%02x%02x%02x%02x (want 00009aa9)\n",
 +		    d4[3], d4[2], d4[1], d4[0]);
++		sweet_log_flush_sync();
++	}
 +	hx_wait(10);
 +	register_read(0x10007014u, d4, 4);		/* FW ID */
 +	printf("SWEET HMAX: fw id = %02x%02x%02x%02x (want ea159003)\n",
 +	    d4[0], d4[1], d4[2], d4[3]);
-+	printf("SWEET HMAX: step: sense on\n");
-+	hx_wait(1500);
++	sweet_log_flush_sync();
++	say("step: sense on");
 +	sense_on();
 +	hx_wait(10);
 +	return true;
@@ -670,9 +684,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	    HX_GPIO_PAGE);
 +	if (!hx.se || !hx.gcc || !hx.g03 || !hx.g99 || !hx.g125) {
 +		printf("SWEET HMAX: MMIO map failed\n");
++		sweet_log_flush_sync();
 +		goto out;
 +	}
-+	printf("SWEET HMAX: maps ok\n");
++	say("maps ok");
 +	/* clocks: vote wrap0_s1 + wrap0 ahb, verify the RCG comes out of halt */
 +	wr(hx.gcc, HX_GCC_VOTE, rd(hx.gcc, HX_GCC_VOTE) |
 +	    HX_GCC_S1_BIT | HX_GCC_AHB0_BIT);
@@ -684,39 +699,37 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	if (!wait_clear(hx.gcc, HX_RCG_CBCR, 1u << 31)) {
 +		printf("SWEET HMAX: RCG halt timeout (cbcr=%#x)\n",
 +		    rd(hx.gcc, HX_RCG_CBCR));
++		sweet_log_flush_sync();
 +		goto out;
 +	}
 +	printf("SWEET HMAX: clock settled cbcr=%#x\n", rd(hx.gcc, HX_RCG_CBCR));
++	sweet_log_flush_sync();
 +	if (!se_init())
 +		goto out;
 +
-+	/* Announce BEFORE each risky step, then pause 1.5 s: the persistent
-+	 * log flushes once a second, so the last line on disk names the step
-+	 * that killed the kernel */
-+	hx_wait(1500);
-+	printf("SWEET HMAX: step: mux spi pins gpio0-3\n");
-+	hx_wait(1500);
++	/* every say() flushes the ring to UFS before the next risky step */
++	say("step: mux spi pins gpio0-3");
 +	for (unsigned p = 0; p < 4; ++p)
 +		gpio_set(hx.g03 + p * HX_GPIO_PAGE, 1, 0, 2, false, false);
-+	printf("SWEET HMAX: step: reset gpio99 out, irq gpio125 in\n");
-+	hx_wait(1500);
++	say("step: reset gpio99 out, irq gpio125 in");
 +	gpio_set(hx.g99, 0, 0, 2, true, true);		/* reset high */
 +	gpio_set(hx.g125, 0, 3, 3, false, false);	/* irq input, pull-up */
-+	printf("SWEET HMAX: step: reset pulse\n");
-+	hx_wait(1500);
++	say("step: reset pulse");
++	hx_wait(50);
 +	/* hardware reset pulse: low 2 ms, high 2 ms (vendor resetgpio_set) */
 +	gpio_set(hx.g99, 0, 0, 2, true, false);
 +	hx_wait(2);
 +	gpio_set(hx.g99, 0, 0, 2, true, true);
 +	hx_wait(2);
-+	printf("SWEET HMAX: step: first SPI bus write\n");
-+	hx_wait(1500);
++	say("step: first SPI bus write");
 +
 +	if (!fw_download()) {
 +		printf("SWEET HMAX: fw download failed; stopping\n");
++		sweet_log_flush_sync();
 +		goto out;
 +	}
 +	printf("SWEET HMAX: fw loaded, polling INT every 10 ms\n");
++	sweet_log_flush_sync();
 +	unsigned errors = 0;
 +	while (!hx.dead) {
 +		if (gpio_read_irq() != 0u) {

@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1045 @@
+@@ -0,0 +1,1048 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -911,10 +911,13 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	 * nobody re-votes these under XNU, so the IC never answers. Vote the
 +	 * AVDD and the 1.8 V candidates before touching the bus. */
 +	{
-+		int r7 = sweet_rpmh_vreg_enable("pm660l_l7", 3100);
-+		int r13 = sweet_rpmh_vreg_enable("pm660_l13", 1800);
-+		int r14 = sweet_rpmh_vreg_enable("pm660_l14", 1800);
-+		printf("SWEET HMAX: vreg l7=%d l13=%d l14=%d\n", r7, r13, r14);
++		/* cmd-db resource names are ldo<pmic-index-letter><n> (the
++		 * sirius board votes "ldoc11"); pm660=a, pm660l=b here */
++		int r7 = sweet_rpmh_vreg_enable("ldob7", 3100);
++		int r13 = sweet_rpmh_vreg_enable("ldoa13", 1800);
++		int r14 = sweet_rpmh_vreg_enable("ldoa14", 1800);
++		printf("SWEET HMAX: vreg ldob7=%d ldoa13=%d ldoa14=%d\n",
++		    r7, r13, r14);
 +		sweet_log_flush_sync();
 +	}
 +	hx_wait(50);	/* rail ramp */

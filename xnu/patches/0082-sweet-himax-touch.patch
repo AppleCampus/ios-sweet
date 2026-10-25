@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,775 @@
+@@ -0,0 +1,791 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -275,14 +275,14 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_S_IRQ_EN, rd(hx.se, SE_S_IRQ_EN) | M_CMD_DONE);
 +	say("se cfg3 ok (m/s irq en)");
 +
-+	/* spi mode 0, 8 bpw, CS0; SE_CLK_SEL 0 = DFS slot 0 = CXO 19.2 MHz
-+	 * (ftbl first entry) — slot 2 was an unbacked guess */
++	/* spi mode 3 (vendor: ts->s_client->mode = SPI_MODE_3 — CPHA bit0,
++	 * CPOL bit2), 8 bpw, CS0; SE_CLK_SEL 0 = CXO/2 9.6 MHz per the S0 RCG */
 +	wr(hx.se, SE_SPI_LOOPBACK, rd(hx.se, SE_SPI_LOOPBACK) & ~0x3u);
 +	wr(hx.se, SE_SPI_DEMUX_SEL, 0);
-+	wr(hx.se, SE_SPI_CPHA, rd(hx.se, SE_SPI_CPHA) & ~1u);
-+	wr(hx.se, SE_SPI_CPOL, rd(hx.se, SE_SPI_CPOL) & ~0x4u);
++	wr(hx.se, SE_SPI_CPHA, rd(hx.se, SE_SPI_CPHA) | 1u);
++	wr(hx.se, SE_SPI_CPOL, rd(hx.se, SE_SPI_CPOL) | 0x4u);
 +	wr(hx.se, SE_SPI_DEMUX_OUTPUT_INV, 0);
-+	say("se spi mode ok");
++	say("se spi mode ok (mode3)");
 +	say("se: writing clk_sel/ser");
 +	wr(hx.se, SE_CLK_SEL, 0);
 +	wr(hx.se, SE_SER_M_CLK_CFG, (2u << 4) | 1u);
@@ -489,19 +489,28 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +interface_on(void)
 +{
 +	uint8_t d[5];
-+	if (bus_read(0x08, d, 4) != 0)
++	uint8_t chk1 = 0, chk2 = 0;
++	if (bus_read(0x08, d, 4) != 0) {
++		printf("SWEET HMAX: if_on dummy read failed\n");
++		sweet_log_flush_sync();
 +		return;
++	}
 +	for (unsigned cnt = 0; cnt < 10; ++cnt) {
 +		uint8_t b31 = 0x31, b10 = 0x10;
-+		uint8_t chk1 = 0, chk2 = 0;
 +		(void)bus_write(0x13, &b31, 1);
 +		(void)bus_write(0x0d, &b10, 1);
 +		(void)bus_read(0x13, &chk1, 1);
 +		(void)bus_read(0x0d, &chk2, 1);
-+		if (chk1 == 0x31 && chk2 == 0x10)
++		if (chk1 == 0x31 && chk2 == 0x10) {
++			printf("SWEET HMAX: if_on ok, bus alive (%u tries)\n", cnt);
++			sweet_log_flush_sync();
 +			return;
++		}
 +		hx_wait(1);
 +	}
++	printf("SWEET HMAX: if_on FAILED chk=%02x/%02x (ic not answering)\n",
++	    chk1, chk2);
++	sweet_log_flush_sync();
 +}
 +
 +/* ---- 0F firmware download (vendor verbatim logic) ---- */
@@ -562,6 +571,9 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		(void)bus_write(0x31, &b27, 1);
 +		(void)bus_write(0x32, &b95, 1);
 +		register_read(0x900000a8u, d4, 4);
++		printf("SWEET HMAX: safe mode try %u a8=%02x%02x%02x%02x\n",
++		    cnt, d4[0], d4[1], d4[2], d4[3]);
++		sweet_log_flush_sync();
 +		if (d4[0] == 0x0cu) {
 +			/* reset TCON, then ADC (vendor enter_safe_mode tail) */
 +			flash_write_burst(0x80020020u, zero, 4);
@@ -740,6 +752,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	gpio_set(hx.g99, 0, 0, 2, true, true);
 +	hx_wait(2);
 +	say("step: first SPI bus write");
++	/* bus-alive probe: burst enable + readback (vendor himax_interface_on);
++	 * the chk values prove whether the IC answers at all */
++	interface_on();
++	say("if_on done");
 +
 +	if (!fw_download()) {
 +		printf("SWEET HMAX: fw download failed; stopping\n");

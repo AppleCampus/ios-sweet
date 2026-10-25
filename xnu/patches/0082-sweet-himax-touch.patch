@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,831 @@
+@@ -0,0 +1,811 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -136,8 +136,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#define IRQ_ERR_BITS		0x0eu
 +
 +#define OP_TX_ONLY		1u
-+#define OP_RX_ONLY		2u
-+#define PARAM_FRAG		(1u << 2)
++#define OP_FULL_DUPLEX		3u
 +
 +/* ---- Himax protocol ---- */
 +#define HX_READ_CMD		0xF3u
@@ -303,7 +302,8 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +static bool
 +m_cmd_wait_done(void)
 +{
-+	for (unsigned i = 0; i < 20000; ++i) {
++	/* up to ~1 s: a 48 KiB TX at 4.8 MHz takes ~85 ms */
++	for (unsigned i = 0; i < 1000000; ++i) {
 +		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
 +		if (irq & IRQ_ERR_BITS) {
 +			wr(hx.se, SE_M_IRQ_CLEAR, irq);
@@ -337,10 +337,17 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 + * Pre-fills each chunk, then issues the command (the sequencer waits for
 + * FIFO data, but pre-fill-then-issue is the safe bare-metal pattern).
 + */
++/*
++ * One non-fragmented TX-only command; the FIFO is refilled while the
++ * sequencer drains it. Works for any length (the 48 KiB image is a single
++ * command). M_CMD_DONE fires when TRANS_LEN bytes have been clocked out.
++ */
 +static int
 +spi_tx(const uint8_t *tx, unsigned len)
 +{
-+	unsigned done = 0;
++	unsigned words = (len + 3u) / 4u;
++	unsigned w = 0;
++
 +	if (hx.dead || len == 0)
 +		return EIO;
 +	if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
@@ -349,47 +356,49 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	}
 +	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
 +	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+	while (done < len) {
-+		unsigned chunk = len - done;
-+		bool last = chunk <= hx.fifodepth * 4u;
-+		if (chunk > hx.fifodepth * 4u)
-+			chunk = hx.fifodepth * 4u;
-+		wr(hx.se, SE_SPI_TX_TRANS_LEN, chunk);
-+		for (unsigned i = 0; i < chunk; i += 4) {
-+			uint32_t word = 0;
-+			for (unsigned j = 0; j < 4 && done + i + j < len; ++j)
-+				word |= (uint32_t)tx[done + i + j] << (8u * j);
-+			wr(hx.se, SE_TX_FIFO, word);
-+		}
-+		wr(hx.se, SE_M_CMD, (OP_TX_ONLY << 27) | (last ? 0u : PARAM_FRAG));
-+		if (last) {
-+			/* final chunk: CS releases and M_CMD_DONE fires */
-+			if (!m_cmd_wait_done())
-+				return EIO;
-+		} else {
-+			/* fragmented chunk: DONE is withheld until the chain
-+			 * ends; wait for the FIFO to drain, then the next
-+			 * m_cmd continues the transfer */
-+			if (!wait_clear(hx.se, SE_TX_FIFO_STATUS, RX_FIFO_WC_MSK)) {
-+				hx.dead = true;
-+				return EIO;
-+			}
-+			delay(16);	/* last word shifts out @2.4 MHz */
-+		}
-+		done += chunk;
++	wr(hx.se, SE_SPI_TX_TRANS_LEN, len);
++	while (w < words && w < hx.fifodepth) {
++		uint32_t word = 0;
++		for (unsigned j = 0; j < 4 && (w * 4u + j) < len; ++j)
++			word |= (uint32_t)tx[w * 4u + j] << (8u * j);
++		wr(hx.se, SE_TX_FIFO, word);
++		++w;
 +	}
-+	return 0;
++	wr(hx.se, SE_M_CMD, OP_TX_ONLY << 27);
++	while (w < words) {
++		unsigned wc = rd(hx.se, SE_TX_FIFO_STATUS) & RX_FIFO_WC_MSK;
++		if (wc > hx.fifodepth - 2u) {
++			delay(50);
++			continue;
++		}
++		for (unsigned n = hx.fifodepth - 2u - wc; n > 0 && w < words; --n) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < 4 && (w * 4u + j) < len; ++j)
++				word |= (uint32_t)tx[w * 4u + j] << (8u * j);
++			wr(hx.se, SE_TX_FIFO, word);
++			++w;
++		}
++	}
++	return m_cmd_wait_done() ? 0 : EIO;
 +}
 +
++/* RX capture buffer for one full-duplex read: 3 command bytes + up to a
++ * 56-byte event frame (+ slack). The IC only drives MISO after the command
++ * bytes, so the first three captured bytes are discarded. */
++static uint8_t hx_rxbuf[3u + HX_EVENT_FRAME + 4u];
++
 +/*
-+ * Himax bus read: [0xF3 reg 0x00] out, then len bytes in, CS low throughout
-+ * (FRAGMENTATION chains the two m_cmds). len <= 4 * fifodepth assumed
-+ * (the largest read here is the 56-byte frame; the FIFO is >= 64 bytes).
++ * Himax bus read as ONE full-duplex command: [F3, addr, 00] + len pad bytes
++ * clocked out while len+3 bytes are captured. CS low throughout, no
++ * fragmentation, M_CMD_DONE fires when TRANS_LEN bytes are done.
 + */
 +static int
 +bus_read(uint8_t cmd, uint8_t *data, unsigned len)
 +{
-+	if (hx.dead)
++	unsigned total = 3u + len;
++	unsigned got = 0;
++
++	if (hx.dead || len == 0 || len > HX_EVENT_FRAME)
 +		return EIO;
 +	if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
 +		hx.dead = true;
@@ -397,72 +406,43 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	}
 +	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
 +	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+	/* command phase, CS held */
-+	wr(hx.se, SE_SPI_TX_TRANS_LEN, 3);
-+	{
-+		uint32_t word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
++	wr(hx.se, SE_SPI_TX_TRANS_LEN, total);
++	wr(hx.se, SE_SPI_RX_TRANS_LEN, total);
++	for (unsigned i = 0; i < total; i += 4) {
++		uint32_t word = 0;
++		if (i == 0)
++			word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
 +		wr(hx.se, SE_TX_FIFO, word);
 +	}
-+	/* command phase, CS held — the FRAG m_cmd does NOT raise DONE (the
-+	 * chain continues with the RX phase); wait for the FIFO to drain */
-+	wr(hx.se, SE_SPI_TX_TRANS_LEN, 3);
-+	{
-+		uint32_t word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
-+		wr(hx.se, SE_TX_FIFO, word);
-+	}
-+	wr(hx.se, SE_M_CMD, (OP_TX_ONLY << 27) | PARAM_FRAG);
-+	if (!wait_clear(hx.se, SE_TX_FIFO_STATUS, RX_FIFO_WC_MSK)) {
-+		printf("SWEET HMAX: bus_read tx fifo drain timeout\n");
++	wr(hx.se, SE_M_CMD, OP_FULL_DUPLEX << 27);
++	if (!m_cmd_wait_done()) {
++		printf("SWEET HMAX: bus_read fd failed\n");
 +		sweet_log_flush_sync();
-+		hx.dead = true;
 +		return EIO;
 +	}
-+	delay(16);	/* last word shifts out @2.4 MHz */
-+	/* read phase, CS released at the end */
-+	wr(hx.se, SE_SPI_RX_TRANS_LEN, len);
-+	wr(hx.se, SE_M_CMD, OP_RX_ONLY << 27);
-+	unsigned got = 0;
-+	for (unsigned i = 0; i < 30000 && got < len; ++i) {
-+		uint32_t st = rd(hx.se, SE_RX_FIFO_STATUS);
-+		unsigned wc = st & RX_FIFO_WC_MSK;
-+		unsigned valid = 4;
-+		if (st & RX_LAST) {
-+			unsigned v = (st >> 28) & 0x7u;
-+			if (v && v < 4)
-+				valid = v;
-+		}
-+		for (unsigned w = 0; w < wc && got < len; ++w) {
-+			uint32_t word = rd(hx.se, SE_RX_FIFO);
-+			for (unsigned j = 0; j < 4 && got < len; ++j)
-+				data[got++] = (uint8_t)(word >> (8u * j));
-+		}
-+		if (got >= len)
-+			break;
-+		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
-+		if (irq & IRQ_ERR_BITS) {
-+			wr(hx.se, SE_M_IRQ_CLEAR, irq);
-+			printf("SWEET HMAX: bus_read rx irq err=%#x\n", irq);
++	while (got < total) {
++		unsigned wc = rd(hx.se, SE_RX_FIFO_STATUS) & RX_FIFO_WC_MSK;
++		if (wc == 0) {
++			printf("SWEET HMAX: bus_read short rx %u/%u\n", got, total);
 +			sweet_log_flush_sync();
 +			hx.dead = true;
 +			return EIO;
 +		}
-+		if (irq & (M_RX_WM | M_RX_LAST))
-+			wr(hx.se, SE_M_IRQ_CLEAR, irq & (M_RX_WM | M_RX_LAST));
-+		delay(1);
++		for (unsigned k = 0; k < wc && got < total; ++k) {
++			uint32_t word = rd(hx.se, SE_RX_FIFO);
++			for (unsigned j = 0; j < 4 && got < total; ++j)
++				hx_rxbuf[got++] = (uint8_t)(word >> (8u * j));
++		}
 +	}
-+	if (!m_cmd_wait_done()) {
-+		printf("SWEET HMAX: bus_read rx phase failed (got %u/%u)\n",
-+		    got, len);
-+		sweet_log_flush_sync();
-+		return EIO;
-+	}
-+	return got == len ? 0 : EIO;
++	for (unsigned i = 0; i < len; ++i)
++		data[i] = hx_rxbuf[3 + i];
++	return 0;
 +}
 +
 +/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM
 + * image as ONE bus_write burst (himax_bus_write allocates 49152 bytes), and
-+ * spi_tx splits it into FIFO chunks with CS held. Single driver thread, so
-+ * one static buffer is fine. */
++ * spi_tx streams it through the FIFO with a refill loop. Single driver
++ * thread, so one static buffer is fine. */
 +static uint8_t hx_txbuf[2u + 4u + HX_48K_SZ + 16u];
 +
 +static int

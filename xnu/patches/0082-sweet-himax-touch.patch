@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1028 @@
+@@ -0,0 +1,1031 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -296,11 +296,14 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	    rd(hx.se, SE_CLK_SEL), rd(hx.se, SE_SER_M_CLK_CFG));
 +	sweet_log_flush_sync();
 +	say("se clocks ok (clk_sel/ser)");
-+	/* 4 x 8-bit words per FIFO word, MSB-first on the wire */
-+	wr(hx.se, SE_GENI_TX_PACKING_CFG0, 0xc010u);
-+	wr(hx.se, SE_GENI_TX_PACKING_CFG1, 0x1c450u);
-+	wr(hx.se, SE_GENI_RX_PACKING_CFG0, 0xc010u);
-+	wr(hx.se, SE_GENI_RX_PACKING_CFG1, 0x1c450u);
++	/* packing: 4 x 8-bit per FIFO word, MSB first — exactly what the
++	 * vendor se_get_packing_config(8, 4, true) computes. The 0063 goodix
++	 * values (0xc010/0x1c450) do not match that formula; with them the fw
++	 * misparses the fifo stream and every command stalls. */
++	wr(hx.se, SE_GENI_TX_PACKING_CFG0, 0x7f8feu);
++	wr(hx.se, SE_GENI_TX_PACKING_CFG1, 0xfffcfeu);
++	wr(hx.se, SE_GENI_RX_PACKING_CFG0, 0x7f8feu);
++	wr(hx.se, SE_GENI_RX_PACKING_CFG1, 0xfffcfeu);
 +	wr(hx.se, SE_GENI_BYTE_GRAN, 0);
 +	wr(hx.se, SE_SPI_WORD_LEN, (rd(hx.se, SE_SPI_WORD_LEN) & ~0x3ffu) | 4u);
 +	wr(hx.se, SE_SPI_DELAY_COUNTERS, 0);

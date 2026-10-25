@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,718 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -78,6 +78,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#define HX_GPIO_S(n)	((uint32_t)(n) * 0x1000u)
 +#define HX_GPIO_N(n)	((uint32_t)(n) * 0x1000u)	/* tile base added by caller */
 +#define HX_GPIO_IO	0x4u
++/* map only the used spans — a full 0xc00000 tile map busts the kernel io
++ * map (kmem_alloc of 12 MiB failed with KERN_NO_SPACE on hardware) */
++#define HX_TLMM_N_SPAN	0x0007e000u	/* tile gpio 0..125 incl. irq pin */
++#define HX_TLMM_S_SPAN	0x00004000u	/* tile gpio 0..3 (SE0 pins) */
 +
 +/* ---- GENI SE registers (qcom-geni-se.h) ---- */
 +#define SE_GENI_STATUS		0x040u
@@ -152,7 +156,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#define ZF_ADDR_DIS_RELOAD	0x10007f00u
 +
 +static struct {
-+	vm_offset_t se, gcc, tlmm;
++	vm_offset_t se, gcc, tlmm_n, tlmm_s;
 +	bool started, dead;
 +	uint32_t active, fifodepth;
 +	int x[HX_MAX_PT], y[HX_MAX_PT];
@@ -203,7 +207,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +gpio_set(unsigned pin, bool north, unsigned func, unsigned pull, unsigned drive,
 +    bool out, bool val)
 +{
-+	vm_offset_t base = hx.tlmm + (north ? HX_TLMM_NORTH : HX_TLMM_SOUTH);
++	vm_offset_t base = north ? hx.tlmm_n : hx.tlmm_s;
 +	uint32_t off = north ? HX_GPIO_N(pin) : HX_GPIO_S(pin);
 +	uint32_t cfg = rd(base, off);
 +	if (out) {
@@ -221,7 +225,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +static uint32_t
 +gpio_read(unsigned pin)
 +{
-+	return rd(hx.tlmm + HX_TLMM_NORTH, HX_GPIO_N(pin) + HX_GPIO_IO) & 1u;
++	return rd(hx.tlmm_n, HX_GPIO_N(pin) + HX_GPIO_IO) & 1u;
 +}
 +
 +/* ---- GENI SPI engine ---- */
@@ -651,8 +655,9 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +
 +	hx.se = ml_io_map(HX_SE_PA, 0x4000);
 +	hx.gcc = ml_io_map(HX_GCC_PA, 0x60000);
-+	hx.tlmm = ml_io_map(HX_TLMM_PA, 0xc00000);
-+	if (!hx.se || !hx.gcc || !hx.tlmm) {
++	hx.tlmm_n = ml_io_map(HX_TLMM_PA + HX_TLMM_NORTH, HX_TLMM_N_SPAN);
++	hx.tlmm_s = ml_io_map(HX_TLMM_PA + HX_TLMM_SOUTH, HX_TLMM_S_SPAN);
++	if (!hx.se || !hx.gcc || !hx.tlmm_n || !hx.tlmm_s) {
 +		printf("SWEET HMAX: MMIO map failed\n");
 +		goto out;
 +	}

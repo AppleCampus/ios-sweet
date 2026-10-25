@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,713 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -68,7 +68,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +/* ---- board facts (RMX1971 live FDT + pinctrl-sdm670.c) ---- */
 +#define HX_SE_PA	0x00880000u	/* qupv3_0 SE0, spi@880000 */
 +#define HX_GCC_PA	0x00100000u
-+#define HX_TLMM_PA	0x00340000u
++#define HX_TLMM_PA	0x03400000u	/* live FDT: pinctrl@03400000, 0xc00000 */
 +#define HX_TLMM_SOUTH	0x00900000u	/* gpio 0-3 (SE0 pins) live here */
 +#define HX_TLMM_NORTH	0x00500000u	/* gpio 99 (reset), 125 (irq) */
 +#define HX_GCC_VOTE	0x5200cu
@@ -76,7 +76,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#define HX_GCC_AHB0_BIT	(1u << 17)	/* wrap0 ahb branch (verified at runtime) */
 +#define HX_RCG_CBCR	0x17160u
 +#define HX_GPIO_S(n)	((uint32_t)(n) * 0x1000u)
-+#define HX_GPIO_N(n)	(0x500000u + (uint32_t)(n) * 0x1000u)
++#define HX_GPIO_N(n)	((uint32_t)(n) * 0x1000u)	/* tile base added by caller */
 +#define HX_GPIO_IO	0x4u
 +
 +/* ---- GENI SE registers (qcom-geni-se.h) ---- */
@@ -207,13 +207,14 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	uint32_t off = north ? HX_GPIO_N(pin) : HX_GPIO_S(pin);
 +	uint32_t cfg = rd(base, off);
 +	if (out) {
-+		/* OUT register is +8 (IN is +4); latch before enabling output:
-+		 * no glitch on the reset line */
-+		wr(base, off + 8u, val ? (rd(base, off + 8u) | 1u) :
-+		    (rd(base, off + 8u) & ~1u));
++		/* io_reg (+4) holds both in (bit 0) and out (bit 1) on this
++		 * TLMM generation (pinctrl-sdm670.c: io_reg +4, out_bit 1);
++		 * latch before enabling output: no glitch on the reset line */
++		wr(base, off + 4u, val ? (rd(base, off + 4u) | 2u) :
++		    (rd(base, off + 4u) & ~2u));
 +	}
 +	cfg &= ~0x3ffu;
-+	cfg |= func | (pull << 2) | (drive << 6) | (out ? 0x200u : 0u);
++	cfg |= pull | (func << 2) | (drive << 6) | (out ? 0x200u : 0u);
 +	wr(base, off, cfg);
 +}
 +

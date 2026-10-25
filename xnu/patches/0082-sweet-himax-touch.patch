@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1063 @@
+@@ -0,0 +1,1028 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -544,12 +544,17 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +static void
 +wire_probe(void)
 +{
-+	uint8_t r4[4] = { 0xde, 0xad, 0xbe, 0xef };
-+	unsigned total = 10u;		/* 0xF2 0x00 addr(4) data(4) */
-+	unsigned rx_total = 7u;		/* 0xF3 0x00 00 + 4 pad */
-+	unsigned got = 0;
++	uint8_t buf[12] = { 0xF2, 0x00, 0x00, 0x7f, 0x00, 0x01,
++	    0xa9, 0x9a, 0x00, 0x00, 0, 0 };
++	unsigned pad = 0;
++	bool done = false;
 +
-+	printf("SWEET HMAX: probe int=%u\n", gpio_read_irq());
++	/* pin config readbacks: gpio0-3 must carry mux=1 (qup0) */
++	printf("SWEET HMAX: probe gpiocfg %08x %08x %08x %08x mcmd=%#x\n",
++	    rd(hx.g03, 0), rd(hx.g03 + HX_GPIO_PAGE, 0),
++	    rd(hx.g03 + 2 * HX_GPIO_PAGE, 0),
++	    rd(hx.g03 + 3 * HX_GPIO_PAGE, 0),
++	    rd(hx.se, 0x600u));
 +	sweet_log_flush_sync();
 +
 +	if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
@@ -559,87 +564,47 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	}
 +	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
 +	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+	/* write 0x10007f00 <- a9 9a 00 00 */
-+	wr(hx.se, SE_SPI_TX_TRANS_LEN, total);
-+	{
-+		uint32_t words[3] = { 0 };
-+		uint8_t buf[12] = { 0xF2, 0x00, 0x00, 0x7f, 0x00, 0x01,
-+		    0xa9, 0x9a, 0x00, 0x00, 0, 0 };
-+		for (unsigned i = 0; i < 3; ++i) {
-+			for (unsigned j = 0; j < 4; ++j)
-+				words[i] |= (uint32_t)buf[i * 4u + j] << (8u * j);
-+			wr(hx.se, SE_TX_FIFO, words[i]);
-+		}
++	/* 10-byte write (0x10007f00 <- a99a0000), TRANS_LEN=10: feed words
++	 * until DONE and COUNT them — bytes (3 words) vs words (10 words)
++	 * settles the TRANS_LEN unit question in one shot */
++	wr(hx.se, SE_SPI_TX_TRANS_LEN, 10);
++	for (unsigned i = 0; i < 3; ++i) {
++		uint32_t word = 0;
++		for (unsigned j = 0; j < 4; ++j)
++			word |= (uint32_t)buf[i * 4u + j] << (8u * j);
++		wr(hx.se, SE_TX_FIFO, word);
 +	}
 +	wr(hx.se, SE_M_CMD, OP_TX_ONLY << 27);
-+	hx_wait(20);
-+	printf("SWEET HMAX: probe after wr st=%#x irq=%#x txwc=%#x\n",
-+	    rd(hx.se, SE_GENI_STATUS), rd(hx.se, SE_M_IRQ_STATUS),
-+	    rd(hx.se, SE_TX_FIFO_STATUS));
-+	sweet_log_flush_sync();
-+	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+	/* readback, the vendor 3-step: burst enable, set AHB address (0x00),
-+	 * 0x0C <- 0, then read 4 bytes via 0x08 (full duplex, skip 3) */
-+	{
-+		uint8_t seq[3][12] = {
-+		    { 0xF2, 0x13, 0x31 },
-+		    { 0xF2, 0x00, 0x00, 0x7f, 0x00, 0x01 },
-+		    { 0xF2, 0x0C, 0x00 },
-+		};
-+		unsigned lens[3] = { 3, 6, 3 };
-+		for (unsigned s = 0; s < 3; ++s) {
-+			unsigned words = (lens[s] + 3u) / 4u;
-+			wr(hx.se, SE_SPI_TX_TRANS_LEN, lens[s]);
-+			for (unsigned i = 0; i < words; ++i) {
-+				uint32_t word = 0;
-+				for (unsigned j = 0; j < 4; ++j) {
-+					unsigned o = i * 4u + j;
-+					if (o < lens[s])
-+						word |= (uint32_t)seq[s][o] << (8u * j);
-+				}
-+				wr(hx.se, SE_TX_FIFO, word);
-+			}
-+			wr(hx.se, SE_M_CMD, OP_TX_ONLY << 27);
-+			hx_wait(20);
-+			wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+			wr(hx.se, SE_SPI_TRANS_CFG,
-+			    rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+		}
-+	}
-+	/* full-duplex read via cmd 0x08: [F3 08 00 + 4 pad], rx 7, take [3..7) */
-+	wr(hx.se, SE_SPI_TX_TRANS_LEN, rx_total);
-+	wr(hx.se, SE_SPI_RX_TRANS_LEN, rx_total);
-+	{
-+		uint32_t words[2] = { 0 };
-+		uint8_t buf[8] = { 0xF3, 0x08, 0, 0, 0, 0, 0, 0 };
-+		for (unsigned i = 0; i < 2; ++i) {
-+			for (unsigned j = 0; j < 4; ++j)
-+				words[i] |= (uint32_t)buf[i * 4u + j] << (8u * j);
-+			wr(hx.se, SE_TX_FIFO, words[i]);
-+		}
-+	}
-+	wr(hx.se, SE_M_CMD, OP_FULL_DUPLEX << 27);
-+	hx_wait(20);
-+	printf("SWEET HMAX: probe after rd st=%#x irq=%#x rxst=%#x\n",
-+	    rd(hx.se, SE_GENI_STATUS), rd(hx.se, SE_M_IRQ_STATUS),
-+	    rd(hx.se, SE_RX_FIFO_STATUS));
-+	sweet_log_flush_sync();
-+	while (got < rx_total) {
-+		unsigned wc = rd(hx.se, SE_RX_FIFO_STATUS) & RX_FIFO_WC_MSK;
-+		if (wc == 0)
++	for (unsigned guard = 0; guard < 400 && !done; ++guard) {
++		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
++		if (irq & (1u << 0)) {		/* M_CMD_DONE */
++			wr(hx.se, SE_M_IRQ_CLEAR, irq);
++			done = true;
 +			break;
-+		for (unsigned k = 0; k < wc && got < rx_total; ++k) {
-+			uint32_t word = rd(hx.se, SE_RX_FIFO);
-+			for (unsigned j = 0; j < 4 && got < rx_total; ++j)
-+				hx_rxbuf[got++] = (uint8_t)(word >> (8u * j));
 +		}
++		if (irq & IRQ_ERR_BITS) {
++			wr(hx.se, SE_M_IRQ_CLEAR, irq);
++			printf("SWEET HMAX: probe irq err=%#x at pad %u\n",
++			    irq, pad);
++			break;
++		}
++		if ((rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC) <
++		    hx.fifodepth - 2u) {
++			wr(hx.se, SE_TX_FIFO, 0);
++			++pad;
++		}
++		delay(20);
 +	}
-+	printf("SWEET HMAX: readback=%02x%02x%02x%02x (want a99a0000) rxbytes=%u\n",
-+	    hx_rxbuf[3], hx_rxbuf[4], hx_rxbuf[5], hx_rxbuf[6], got);
++	printf("SWEET HMAX: probe tx done=%d pad=%u total=%u words, "
++	    "st=%#x irq=%#x\n", done, pad, 3u + pad,
++	    rd(hx.se, SE_GENI_STATUS), rd(hx.se, SE_M_IRQ_STATUS));
 +	sweet_log_flush_sync();
-+	printf("SWEET HMAX: probe int=%u\n", gpio_read_irq());
-+	sweet_log_flush_sync();
++	wr(hx.se, SE_M_CMD_CTRL, M_CMD_CANCEL);
++	hx_wait(2);
++	wr(hx.se, SE_M_CMD_CTRL, M_CMD_ABORT);
++	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	hx.dead = false;
++	bus_reset();
 +}
 +
 +/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM

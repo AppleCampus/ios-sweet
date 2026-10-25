@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,721 @@
+@@ -0,0 +1,734 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -567,10 +567,14 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	uint8_t reset55[4] = { 0x55, 0, 0, 0 };
 +
 +	register_write(ZF_ADDR_SYS_RESET, reset55, 4);
++	printf("SWEET HMAX: sys reset done\n");
++	hx_wait(1500);
 +	if (!enter_safe_mode()) {
 +		printf("SWEET HMAX: safe mode failed\n");
 +		return false;
 +	}
++	printf("SWEET HMAX: safe mode ok\n");
++	hx_wait(1500);
 +	for (unsigned retry = 0; retry < 10 && crc != 0; ++retry) {
 +		write_sram_0f(ZF_DATA_SRAM_START, 0, HX_48K_SZ);
 +		crc = hw_check_crc(ZF_DATA_SRAM_START, HX_48K_SZ);
@@ -579,6 +583,8 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	}
 +	if (crc != 0)
 +		return false;
++	printf("SWEET HMAX: 48k crc ok\n");
++	hx_wait(1500);
 +	write_sram_0f(0x10007000u, 0xC000u, 128u);
 +	write_sram_0f(0x10007084u, 0xC100u, 528u);
 +	write_sram_0f(0x10007300u, 0xCA00u, 128u);
@@ -675,12 +681,18 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	if (!se_init())
 +		goto out;
 +
++	/* 1.5 s pauses between steps: the persistent log flushes once a
++	 * second, so each anchor lands on disk even if the next step kills
++	 * the kernel */
++	hx_wait(1500);
 +	/* pins: qup0 mux=1 on gpio0-3 (SOUTH); reset 99 out; irq 125 in, pull-up */
 +	for (unsigned p = 0; p < 4; ++p)
 +		gpio_set(hx.g03 + p * HX_GPIO_PAGE, 1, 0, 2, false, false);
++	printf("SWEET HMAX: spi pins muxed\n");
++	hx_wait(1500);
 +	gpio_set(hx.g99, 0, 0, 2, true, true);		/* reset high */
 +	gpio_set(hx.g125, 0, 3, 3, false, false);	/* irq input, pull-up */
-+	printf("SWEET HMAX: pins configured\n");
++	printf("SWEET HMAX: reset high, irq input\n");
 +	hx_wait(50);
 +	/* hardware reset pulse: low 2 ms, high 2 ms (vendor resetgpio_set) */
 +	gpio_set(hx.g99, 0, 0, 2, true, false);
@@ -688,6 +700,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	gpio_set(hx.g99, 0, 0, 2, true, true);
 +	hx_wait(2);
 +	printf("SWEET HMAX: reset pulsed\n");
++	hx_wait(1500);
 +
 +	if (!fw_download()) {
 +		printf("SWEET HMAX: fw download failed; stopping\n");

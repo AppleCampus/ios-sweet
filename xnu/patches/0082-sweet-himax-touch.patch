@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1045 @@
+@@ -0,0 +1,1063 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -953,19 +953,37 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	}
 +	printf("SWEET HMAX: clock settled s0 cbcr=%#x cfg=%#x\n",
 +	    rd(hx.gcc, HX_RCG_S0_CBCR), rd(hx.gcc, HX_RCG_S0_CBCR + 8u));
-+	/* The S0 RCG is in DFS mode (cfg bit 20) with slot 0 unprogrammed:
-+	 * no serial clock, so no m_cmd ever completes. Force a plain CXO/1
-+	 * = 19.2 MHz config and strobe UPDATE. */
-+	wr(hx.gcc, HX_RCG_S0_CFG, 0);
-+	wr(hx.gcc, HX_RCG_S0_CMD, 1u);
-+	if (!wait_clear(hx.gcc, HX_RCG_S0_CMD, 1u)) {
-+		printf("SWEET HMAX: rcg update stuck\n");
++	{
++		/* 4.9 GENI S clocks: DFS enable at cmd_rcgr+0x14, per-slot
++		 * CFG-format banks at cmd_rcgr+0x1c+i*4. With DFS on, the
++		 * kernel never programs the RCG — the slots come from boot
++		 * firmware, and an unprogrammed slot (0) = no serial clock
++		 * at all, which is exactly our bring-up stall. */
++		unsigned dfs = rd(hx.gcc, HX_RCG_S0_CBCR + 0x18u);
++		printf("SWEET HMAX: dfs en=%#x slots %#x %#x %#x %#x\n",
++		    dfs, rd(hx.gcc, HX_RCG_S0_CBCR + 0x20u),
++		    rd(hx.gcc, HX_RCG_S0_CBCR + 0x24u),
++		    rd(hx.gcc, HX_RCG_S0_CBCR + 0x28u),
++		    rd(hx.gcc, HX_RCG_S0_CBCR + 0x2cu));
 +		sweet_log_flush_sync();
-+		goto out;
++		if (dfs & 1u) {
++			if ((rd(hx.gcc, HX_RCG_S0_CBCR + 0x20u) & 0x1ffu) == 0) {
++				wr(hx.gcc, HX_RCG_S0_CBCR + 0x20u, 1u); /* CXO, /2 */
++				printf("SWEET HMAX: dfs slot0 programmed 9.6MHz\n");
++			} else {
++				printf("SWEET HMAX: dfs slot0 valid\n");
++			}
++			sweet_log_flush_sync();
++		} else {
++			/* plain RCG: force CXO/1 and strobe UPDATE */
++			wr(hx.gcc, HX_RCG_S0_CFG, 0);
++			wr(hx.gcc, HX_RCG_S0_CMD, 1u);
++			(void)wait_clear(hx.gcc, HX_RCG_S0_CMD, 1u);
++			printf("SWEET HMAX: rcg reprogrammed cfg=%#x\n",
++			    rd(hx.gcc, HX_RCG_S0_CFG));
++			sweet_log_flush_sync();
++		}
 +	}
-+	printf("SWEET HMAX: rcg reprogrammed cfg=%#x\n",
-+	    rd(hx.gcc, HX_RCG_S0_CFG));
-+	sweet_log_flush_sync();
 +	if (!se_init())
 +		goto out;
 +

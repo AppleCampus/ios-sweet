@@ -1,36 +1,29 @@
-From: SWEET RMX1971 port (ZCode agent + AppleCampus)
-Subject: [PATCH 0084] sweet: retarget rpmh to RMX1971 apps_rsc, generic vreg votes
-
-RMX1971 (sdm670 family): apps_rsc tcs-drv @0x179e0000/+0xd00 (DT
-qcom,drv-id 2, tcs-config ACTIVE 3), cmd-db locator @0x0c3f000c
-(unchanged). Relax the ldoc11-only wrapper so touch rails such as
-ldob7 can be voted by cmd-db resource name. pmic4-ldo: two commands
-(voltage@0 + enable@4), no PMIC5 mode code. Includes a cmd-db name dump.
-
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -16,7 +16,7 @@
+@@ -14,12 +14,12 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ 
  /* Live downstream DT has two positional reg entries, no reg-names. */
 -#define RH_RSC_PA       0x18220000u
 -#define RH_TCS_PA       0x18220d00u
++#define RH_RSC_PA       0x179e0000u
++#define RH_TCS_PA       0x179e0d00u
  #define RH_TCS_SIZE     0x3000u
  #define RH_DICT_PA      0x0c3f000cu
  #define RH_DRV          2u
 -#define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
-+#define RH_RSC_PA       0x179e0000u
-+#define RH_TCS_PA       0x179e0d00u
 +#define RH_ACTIVE_N     3u       /* RMX1971 DT: ACTIVE 3, SLEEP 3, WAKE 2 */
---- a/bsd/dev/sweet_rpmh.c
-+++ b/bsd/dev/sweet_rpmh.c
-@@ -148,6 +148,30 @@
- 	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
+ #define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+ #define RH_TCS_STRIDE   0x2a0u
+ #define RH_CMD_STRIDE   0x14u
+@@ -155,6 +155,30 @@ rh_map(void)
  		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
  		return EINVAL;
  	}
 +	/* enumerate resource names so board bring-up can see the truth */
 +	for (uint32_t e = RH_DB_HEADER, shown = 0;
-+		    e + RH_DB_ENTRY <= rh_db_size && shown < 120;
-+		    e += RH_DB_ENTRY) {
++	    e + RH_DB_ENTRY <= rh_db_size && shown < 120;
++	    e += RH_DB_ENTRY) {
 +		uint32_t key[2] = { rh_read(rh_db, e), rh_read(rh_db, e + 4) };
 +		char nm[9];
 +		if (!(key[0] | key[1])) {
@@ -53,16 +46,18 @@ ldob7 can be voted by cmd-db resource name. pmic4-ldo: two commands
 +	}
  	return 0;
  }
---- a/bsd/dev/sweet_rpmh.c
-+++ b/bsd/dev/sweet_rpmh.c
-@@ -269,28 +293,29 @@
+ 
+@@ -266,11 +290,12 @@ rh_send(uint32_t address, unsigned mv)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
 -	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
 -	const uint32_t offsets[3] = {0, 8, 4};
 -	const uint32_t values[3] = {mv, 7, 1};
 -	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
 -	for (unsigned c = 0; c < 3; ++c) {
-+	/* pmic4-ldo (per DT regulator-type): voltage + enable only; the
-+	 * rail powers up in its DT init-mode, and a PMIC5 mode code would NAK */
++	/* pmic4-ldo (per DT regulator-type): voltage + enable only; a
++	 * PMIC5 mode code would NAK, the rail boots in its DT init-mode */
 +	const uint32_t offsets[2] = {0, 4};
 +	const uint32_t values[2] = {mv, 1};
 +	printf("SWEET RPMH: TCS%u ACTIVE %u mV enable=1 irq-enable=%#x\n", t, mv, irq_en);
@@ -70,7 +65,7 @@ ldob7 can be voted by cmd-db resource name. pmic4-ldo: two commands
  		uint32_t cmd = b + c * RH_CMD_STRIDE;
  		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
  		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
- 		    !rh_sync(cmd + RH_DATA, values[c])) {
+@@ -278,18 +303,18 @@ rh_send(uint32_t address, unsigned mv)
  			return EIO;
  		}
  	}
@@ -92,22 +87,17 @@ ldob7 can be voted by cmd-db resource name. pmic4-ldo: two commands
  			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
  			complete &= status[c] != 0xffffffffu &&
  			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
- 		}
---- a/bsd/dev/sweet_rpmh.c
-+++ b/bsd/dev/sweet_rpmh.c
-@@ -327,8 +352,10 @@
+@@ -327,9 +352,10 @@ rh_send(uint32_t address, unsigned mv)
  int
  sweet_rpmh_vreg_enable(const char *res, unsigned mv)
  {
 -	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
 -	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
 -		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
--		return EINVAL;
--	}
-+	/* Generic PMIC5-LDO ARC vote (voltage@0, HPM@8, enable@4); the
-+	 * geometry checks in rh_map() refuse mismatched hardware. */
++	/* Generic PMIC5-LDO ARC vote; geometry checks refuse mismatched hw. */
 +	if (!res || !res[0] || mv < 800 || mv > 3600) {
 +		printf("SWEET RPMH: bad vreg request %s %u mV\n",
-+			res ? res : "(null)", mv);
-+		return EINVAL;
-+	}
++		    res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {

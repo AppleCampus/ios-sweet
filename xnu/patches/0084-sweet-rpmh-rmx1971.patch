@@ -1,0 +1,39 @@
+From: SWEET RMX1971 port (ZCode agent + AppleCampus)
+Subject: [PATCH 0084] sweet: retarget rpmh to RMX1971 apps_rsc, generic vreg votes
+
+RMX1971 (sdm670 family): apps_rsc tcs-drv @0x179e0000/+0xd00 (DT
+qcom,drv-id 2, tcs-config ACTIVE 3), cmd-db locator @0x0c3f000c
+(unchanged). Relax the ldoc11-only wrapper so touch rails such as
+pm660l_l7 can be voted by cmd-db resource name.
+
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -16,7 +16,7 @@
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+-#define RH_RSC_PA       0x18220000u
+-#define RH_TCS_PA       0x18220d00u
+ #define RH_TCS_SIZE     0x3000u
+ #define RH_DICT_PA      0x0c3f000cu
+ #define RH_DRV          2u
+-#define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
++#define RH_RSC_PA       0x179e0000u
++#define RH_TCS_PA       0x179e0d00u
++#define RH_ACTIVE_N     3u       /* RMX1971 DT: ACTIVE 3, SLEEP 3, WAKE 2 */
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -327,8 +329,10 @@
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
+-		return EINVAL;
+-	}
++	/* Generic PMIC5-LDO ARC vote (voltage@0, HPM@8, enable@4); the
++	 * geometry checks in rh_map() refuse mismatched hardware. */
++	if (!res || !res[0] || mv < 800 || mv > 3600) {
++		printf("SWEET RPMH: bad vreg request %s %u mV\n",
++			res ? res : "(null)", mv);
++		return EINVAL;
++	}

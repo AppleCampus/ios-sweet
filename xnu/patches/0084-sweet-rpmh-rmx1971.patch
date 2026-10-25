@@ -4,7 +4,8 @@ Subject: [PATCH 0084] sweet: retarget rpmh to RMX1971 apps_rsc, generic vreg vot
 RMX1971 (sdm670 family): apps_rsc tcs-drv @0x179e0000/+0xd00 (DT
 qcom,drv-id 2, tcs-config ACTIVE 3), cmd-db locator @0x0c3f000c
 (unchanged). Relax the ldoc11-only wrapper so touch rails such as
-pm660l_l7 can be voted by cmd-db resource name.
+ldob7 can be voted by cmd-db resource name. pmic4-ldo: two commands
+(voltage@0 + enable@4), no PMIC5 mode code. Includes a cmd-db name dump.
 
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
@@ -21,25 +22,7 @@ pm660l_l7 can be voted by cmd-db resource name.
 +#define RH_ACTIVE_N     3u       /* RMX1971 DT: ACTIVE 3, SLEEP 3, WAKE 2 */
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -327,8 +329,10 @@
- int
- sweet_rpmh_vreg_enable(const char *res, unsigned mv)
- {
--	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
--	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
--		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
--		return EINVAL;
--	}
-+	/* Generic PMIC5-LDO ARC vote (voltage@0, HPM@8, enable@4); the
-+	 * geometry checks in rh_map() refuse mismatched hardware. */
-+	if (!res || !res[0] || mv < 800 || mv > 3600) {
-+		printf("SWEET RPMH: bad vreg request %s %u mV\n",
-+			res ? res : "(null)", mv);
-+		return EINVAL;
-+	}
---- a/bsd/dev/sweet_rpmh.c
-+++ b/bsd/dev/sweet_rpmh.c
-@@ -148,6 +172,30 @@
+@@ -148,6 +148,30 @@
  	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
  		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
  		return EINVAL;
@@ -72,7 +55,7 @@ pm660l_l7 can be voted by cmd-db resource name.
  }
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -269,28 +270,29 @@
+@@ -269,28 +293,29 @@
 -	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
 -	const uint32_t offsets[3] = {0, 8, 4};
 -	const uint32_t values[3] = {mv, 7, 1};
@@ -110,3 +93,21 @@ pm660l_l7 can be voted by cmd-db resource name.
  			complete &= status[c] != 0xffffffffu &&
  			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
  		}
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -327,8 +352,10 @@
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
+-		return EINVAL;
+-	}
++	/* Generic PMIC5-LDO ARC vote (voltage@0, HPM@8, enable@4); the
++	 * geometry checks in rh_map() refuse mismatched hardware. */
++	if (!res || !res[0] || mv < 800 || mv > 3600) {
++		printf("SWEET RPMH: bad vreg request %s %u mV\n",
++			res ? res : "(null)", mv);
++		return EINVAL;
++	}

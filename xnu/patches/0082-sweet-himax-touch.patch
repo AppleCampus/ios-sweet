@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1031 @@
+@@ -0,0 +1,1045 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -64,6 +64,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +extern kern_return_t thread_terminate(thread_t);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +extern void sweet_log_flush_sync(void);	/* bsd/dev/sweet_ufs.c */
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 +void sweet_himax_init(void);
 +
 +/* ---- board facts (RMX1971 live FDT + pinctrl-sdm670.c) ---- */
@@ -301,9 +302,9 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	 * values (0xc010/0x1c450) do not match that formula; with them the fw
 +	 * misparses the fifo stream and every command stalls. */
 +	wr(hx.se, SE_GENI_TX_PACKING_CFG0, 0x7f8feu);
-+	wr(hx.se, SE_GENI_TX_PACKING_CFG1, 0xfffcfeu);
++	wr(hx.se, SE_GENI_TX_PACKING_CFG1, 0xffefeu);
 +	wr(hx.se, SE_GENI_RX_PACKING_CFG0, 0x7f8feu);
-+	wr(hx.se, SE_GENI_RX_PACKING_CFG1, 0xfffcfeu);
++	wr(hx.se, SE_GENI_RX_PACKING_CFG1, 0xffefeu);
 +	wr(hx.se, SE_GENI_BYTE_GRAN, 0);
 +	wr(hx.se, SE_SPI_WORD_LEN, (rd(hx.se, SE_SPI_WORD_LEN) & ~0x3ffu) | 4u);
 +	wr(hx.se, SE_SPI_DELAY_COUNTERS, 0);
@@ -314,8 +315,9 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +static bool
 +m_cmd_wait_done(void)
 +{
-+	/* up to ~1 s: a 48 KiB TX at 4.8 MHz takes ~85 ms */
-+	for (unsigned i = 0; i < 1000000; ++i) {
++	/* ~200 ms ceiling: a 48 KiB TX at 9.6 MHz takes ~45 ms; the earlier
++	 * 1 s timeout x 20 safe-mode retries dragged boot out by 12 minutes */
++	for (unsigned i = 0; i < 200000; ++i) {
 +		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
 +		if (irq & IRQ_ERR_BITS) {
 +			wr(hx.se, SE_M_IRQ_CLEAR, irq);
@@ -754,7 +756,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +
 +	flash_write_burst(0x9000005cu, a5, 4);
 +	hx_wait(20);
-+	for (unsigned cnt = 0; cnt < 20; ++cnt) {
++	for (unsigned cnt = 0; cnt < 3; ++cnt) {
 +		uint8_t b27 = 0x27, b95 = 0x95, b00 = 0x00;
 +		(void)bus_write(0x31, &b27, 1);
 +		(void)bus_write(0x32, &b95, 1);
@@ -904,6 +906,18 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		goto out;
 +	}
 +	say("maps ok");
++	/* touch power: TWRP (touch working) runs pm660l_l7 at 3.09 V (the TP
++	 * AVDD; vendor tp_powercontrol_2v8 sets 3.1 V) plus a 1.8 V VDDIO —
++	 * nobody re-votes these under XNU, so the IC never answers. Vote the
++	 * AVDD and the 1.8 V candidates before touching the bus. */
++	{
++		int r7 = sweet_rpmh_vreg_enable("pm660l_l7", 3100);
++		int r13 = sweet_rpmh_vreg_enable("pm660_l13", 1800);
++		int r14 = sweet_rpmh_vreg_enable("pm660_l14", 1800);
++		printf("SWEET HMAX: vreg l7=%d l13=%d l14=%d\n", r7, r13, r14);
++		sweet_log_flush_sync();
++	}
++	hx_wait(50);	/* rail ramp */
 +	/* clocks: vote SE0's serial clock (wrap0 S0) + wrap0 ahb. The first
 +	 * bring-up voted S1 by mistake and the FORCE_DEFAULT write then died
 +	 * on a dead core clock */

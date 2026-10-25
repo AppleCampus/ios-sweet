@@ -74,6 +74,16 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
 
+      # build.sh's patch loop only WARNS on a failed git apply and moves on,
+      # so a silently skipped patch ships a kernel without the driver. Fail
+      # the job if any of our bsd/dev sources is missing from the patched tree.
+      - name: Assert sweet patches applied
+        if: always()
+        run: |
+          for f in sweet_ufs sweet_keys sweet_touch sweet_usb sweet_himax; do
+            test -f "dxb/xnu/bsd/dev/$f.c" || { echo "::error::$f.c missing — a sweet patch did not apply"; exit 1; }
+          done
+
       - name: Package build tree for local compiles
         if: always()
         run: |

@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,764 @@
+@@ -0,0 +1,770 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -250,17 +250,22 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		return false;
 +	}
 +
-+	/* se_io_init + fifo mode (qcom-geni-se.c) — one anchor per group:
-+	 * a write here can kill the machine, and the anchor names the group */
++	/* se_io_init + fifo mode (qcom-geni-se.c) — an anchor around EACH of
++	 * the first writes: one of them kills the machine */
++	say("se: about to configure engine");
 +	wr(hx.se, GENI_CGC_CTRL, rd(hx.se, GENI_CGC_CTRL) | 0x7fu);
++	say("se: cgc done");
 +	wr(hx.se, SE_DMA_GENERAL_CFG, rd(hx.se, SE_DMA_GENERAL_CFG) | 0x0fu);
++	say("se: dma done");
 +	wr(hx.se, GENI_OUTPUT_CTRL, 0x7fu);
++	say("se: out done");
 +	wr(hx.se, GENI_FORCE_DEFAULT, 1u);
-+	say("se cfg1 ok (cgc/dma/out/force)");
++	say("se: force done");
 +	wr(hx.se, SE_IRQ_EN, rd(hx.se, SE_IRQ_EN) | 0x0fu);
 +	wr(hx.se, SE_GSI_EVENT_EN, 0);
 +	wr(hx.se, SE_GENI_DMA_MODE_EN, rd(hx.se, SE_GENI_DMA_MODE_EN) & ~1u);
 +	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	say("se: m_irq_clear done");
 +	wr(hx.se, SE_S_IRQ_CLEAR, 0xffffffffu);
 +	say("se cfg2 ok (irq en/clear)");
 +	wr(hx.se, SE_M_IRQ_EN, rd(hx.se, SE_M_IRQ_EN) | M_IRQ_COMMON |
@@ -275,6 +280,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_SPI_CPOL, rd(hx.se, SE_SPI_CPOL) & ~0x4u);
 +	wr(hx.se, SE_SPI_DEMUX_OUTPUT_INV, 0);
 +	say("se spi mode ok");
++	say("se: writing clk_sel/ser");
 +	wr(hx.se, SE_CLK_SEL, 2);
 +	wr(hx.se, SE_SER_M_CLK_CFG, (2u << 4) | 1u);
 +	say("se clocks ok (clk_sel/ser)");

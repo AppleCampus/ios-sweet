@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,791 @@
+@@ -0,0 +1,809 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -306,6 +306,9 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
 +		if (irq & IRQ_ERR_BITS) {
 +			wr(hx.se, SE_M_IRQ_CLEAR, irq);
++			printf("SWEET HMAX: m_cmd irq err=%#x st=%#x\n",
++			    irq, rd(hx.se, SE_GENI_STATUS));
++			sweet_log_flush_sync();
 +			hx.dead = true;
 +			return false;
 +		}
@@ -315,6 +318,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		}
 +		delay(1);
 +	}
++	printf("SWEET HMAX: m_cmd timeout st=%#x irq=%#x rxst=%#x\n",
++	    rd(hx.se, SE_GENI_STATUS), rd(hx.se, SE_M_IRQ_STATUS),
++	    rd(hx.se, SE_RX_FIFO_STATUS));
++	sweet_log_flush_sync();
 +	wr(hx.se, SE_M_CMD_CTRL, M_CMD_CANCEL);
 +	hx_wait(2);
 +	wr(hx.se, SE_M_CMD_CTRL, M_CMD_ABORT);
@@ -384,8 +391,11 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		wr(hx.se, SE_TX_FIFO, word);
 +	}
 +	wr(hx.se, SE_M_CMD, (OP_TX_ONLY << 27) | PARAM_FRAG);
-+	if (!m_cmd_wait_done())
++	if (!m_cmd_wait_done()) {
++		printf("SWEET HMAX: bus_read tx phase failed\n");
++		sweet_log_flush_sync();
 +		return EIO;
++	}
 +	/* read phase, CS released at the end */
 +	wr(hx.se, SE_SPI_RX_TRANS_LEN, len);
 +	wr(hx.se, SE_M_CMD, OP_RX_ONLY << 27);
@@ -409,6 +419,8 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
 +		if (irq & IRQ_ERR_BITS) {
 +			wr(hx.se, SE_M_IRQ_CLEAR, irq);
++			printf("SWEET HMAX: bus_read rx irq err=%#x\n", irq);
++			sweet_log_flush_sync();
 +			hx.dead = true;
 +			return EIO;
 +		}
@@ -416,7 +428,13 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +			wr(hx.se, SE_M_IRQ_CLEAR, irq & (M_RX_WM | M_RX_LAST));
 +		delay(1);
 +	}
-+	return m_cmd_wait_done() ? (got == len ? 0 : EIO) : EIO;
++	if (!m_cmd_wait_done()) {
++		printf("SWEET HMAX: bus_read rx phase failed (got %u/%u)\n",
++		    got, len);
++		sweet_log_flush_sync();
++		return EIO;
++	}
++	return got == len ? 0 : EIO;
 +}
 +
 +/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM

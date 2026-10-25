@@ -80,7 +80,7 @@ jobs:
       - name: Assert sweet patches applied
         if: always()
         run: |
-          for f in sweet_ufs sweet_keys sweet_touch sweet_usb sweet_himax; do
+          for f in sweet_ufs sweet_keys sweet_touch sweet_usb sweet_himax sweet_rpmh; do
             test -f "dxb/xnu/bsd/dev/$f.c" || { echo "::error::$f.c missing — a sweet patch did not apply"; exit 1; }
           done
 

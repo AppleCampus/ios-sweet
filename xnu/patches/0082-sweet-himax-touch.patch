@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1048 @@
+@@ -0,0 +1,1053 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -360,7 +360,6 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +static int
 +spi_tx(const uint8_t *tx, unsigned len)
 +{
-+	unsigned words = (len + 3u) / 4u;
 +	unsigned w = 0;
 +
 +	if (hx.dead || len == 0)
@@ -372,6 +371,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
 +	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
 +	wr(hx.se, SE_SPI_TX_TRANS_LEN, len);
++	/* the engine consumes ceil(len/4) + 1 words (measured: L=4 -> 2 fed,
++	 * 8 -> 3, 12 -> 4): one prefetch word beyond the math — push it or
++	 * every command stalls waiting for data (the whole bring-up bug) */
++	unsigned words = (len + 3u) / 4u + 1u;
 +	while (w < words && w < hx.fifodepth) {
 +		uint32_t word = 0;
 +		for (unsigned j = 0; j < 4 && (w * 4u + j) < len; ++j)
@@ -435,7 +438,8 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
 +	wr(hx.se, SE_SPI_TX_TRANS_LEN, total);
 +	wr(hx.se, SE_SPI_RX_TRANS_LEN, total);
-+	for (unsigned i = 0; i < total; i += 4) {
++	/* +1 prefetch word, measured on hardware (see spi_tx) */
++	for (unsigned i = 0; i < total + 4u; i += 4) {
 +		uint32_t word = 0;
 +		if (i == 0)
 +			word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
@@ -489,6 +493,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	{
 +		uint32_t word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
 +		wr(hx.se, SE_TX_FIFO, word);
++		wr(hx.se, SE_TX_FIFO, 0);	/* the +1 prefetch word */
 +	}
 +	wr(hx.se, SE_M_CMD, (OP_TX_ONLY << 27) | PARAM_FRAG);
 +	if (!wait_clear(hx.se, SE_TX_FIFO_STATUS, TX_FIFO_WC)) {

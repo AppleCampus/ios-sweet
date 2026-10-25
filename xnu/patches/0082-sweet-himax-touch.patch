@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,809 @@
+@@ -0,0 +1,831 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -113,6 +113,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#define SE_S_IRQ_CLEAR		0x648u
 +#define SE_TX_FIFO		0x700u
 +#define SE_RX_FIFO		0x780u
++#define SE_TX_FIFO_STATUS	0x800u
 +#define SE_RX_FIFO_STATUS	0x804u
 +#define SE_HW_PARAM_0		0xe24u
 +#define SE_DMA_GENERAL_CFG	0xe30u
@@ -361,8 +362,20 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +			wr(hx.se, SE_TX_FIFO, word);
 +		}
 +		wr(hx.se, SE_M_CMD, (OP_TX_ONLY << 27) | (last ? 0u : PARAM_FRAG));
-+		if (!m_cmd_wait_done())
-+			return EIO;
++		if (last) {
++			/* final chunk: CS releases and M_CMD_DONE fires */
++			if (!m_cmd_wait_done())
++				return EIO;
++		} else {
++			/* fragmented chunk: DONE is withheld until the chain
++			 * ends; wait for the FIFO to drain, then the next
++			 * m_cmd continues the transfer */
++			if (!wait_clear(hx.se, SE_TX_FIFO_STATUS, RX_FIFO_WC_MSK)) {
++				hx.dead = true;
++				return EIO;
++			}
++			delay(16);	/* last word shifts out @2.4 MHz */
++		}
 +		done += chunk;
 +	}
 +	return 0;
@@ -390,12 +403,21 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		uint32_t word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
 +		wr(hx.se, SE_TX_FIFO, word);
 +	}
++	/* command phase, CS held — the FRAG m_cmd does NOT raise DONE (the
++	 * chain continues with the RX phase); wait for the FIFO to drain */
++	wr(hx.se, SE_SPI_TX_TRANS_LEN, 3);
++	{
++		uint32_t word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
++		wr(hx.se, SE_TX_FIFO, word);
++	}
 +	wr(hx.se, SE_M_CMD, (OP_TX_ONLY << 27) | PARAM_FRAG);
-+	if (!m_cmd_wait_done()) {
-+		printf("SWEET HMAX: bus_read tx phase failed\n");
++	if (!wait_clear(hx.se, SE_TX_FIFO_STATUS, RX_FIFO_WC_MSK)) {
++		printf("SWEET HMAX: bus_read tx fifo drain timeout\n");
 +		sweet_log_flush_sync();
++		hx.dead = true;
 +		return EIO;
 +	}
++	delay(16);	/* last word shifts out @2.4 MHz */
 +	/* read phase, CS released at the end */
 +	wr(hx.se, SE_SPI_RX_TRANS_LEN, len);
 +	wr(hx.se, SE_M_CMD, OP_RX_ONLY << 27);

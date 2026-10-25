@@ -61,6 +61,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t ml_get_timebase(void);
 +extern kern_return_t thread_terminate(thread_t);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +extern void sweet_log_flush_sync(void);	/* bsd/dev/sweet_ufs.c */
@@ -549,67 +550,66 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +static void
 +wire_probe(void)
 +{
-+	uint8_t buf[12] = { 0xF2, 0x00, 0x00, 0x7f, 0x00, 0x01,
-+	    0xa9, 0x9a, 0x00, 0x00, 0, 0 };
-+	unsigned pad = 0;
-+	bool done = false;
++	/* TRANS_LEN unit discriminator: for L in 4/8/12 issue a TX command
++	 * and feed pad words until DONE. fed==L -> unit is bytes; fed==L/4
++	 * (rounded) -> unit is 4-byte words. Also time one delay(1000). */
++	const unsigned lens[3] = { 4, 8, 12 };
++	uint64_t t0;
 +
-+	/* pin config readbacks: gpio0-3 must carry mux=1 (qup0) */
-+	printf("SWEET HMAX: probe gpiocfg %08x %08x %08x %08x mcmd=%#x\n",
-+	    rd(hx.g03, 0), rd(hx.g03 + HX_GPIO_PAGE, 0),
-+	    rd(hx.g03 + 2 * HX_GPIO_PAGE, 0),
-+	    rd(hx.g03 + 3 * HX_GPIO_PAGE, 0),
-+	    rd(hx.se, 0x600u));
++	t0 = ml_get_timebase();
++	delay(1000);
++	printf("SWEET HMAX: delay(1000)=%llu tb-ticks\n",
++	    (unsigned long long)(ml_get_timebase() - t0));
 +	sweet_log_flush_sync();
 +
-+	if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
-+		printf("SWEET HMAX: probe: bus busy\n");
++	for (unsigned li = 0; li < 3; ++li) {
++		unsigned len = lens[li];
++		unsigned fed = 0, pad = 0;
++		bool done = false;
++
++		if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
++			printf("SWEET HMAX: probe: bus busy\n");
++			sweet_log_flush_sync();
++			return;
++		}
++		wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++		wr(hx.se, SE_SPI_TRANS_CFG,
++		    rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
++		wr(hx.se, SE_SPI_TX_TRANS_LEN, len);
++		wr(hx.se, SE_TX_FIFO, 0x00F20000u);	/* F2 00 00 00 */
++		++fed;
++		wr(hx.se, SE_M_CMD, OP_TX_ONLY << 27);
++		for (unsigned guard = 0; guard < 200 && !done; ++guard) {
++			uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
++			if (irq & (1u << 0)) {
++				wr(hx.se, SE_M_IRQ_CLEAR, irq);
++				done = true;
++				break;
++			}
++			if (irq & IRQ_ERR_BITS) {
++				wr(hx.se, SE_M_IRQ_CLEAR, irq);
++				printf("SWEET HMAX: probe L=%u irq err=%#x "
++				    "at fed=%u\n", len, irq, fed);
++				break;
++			}
++			if ((rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC) <
++			    hx.fifodepth - 2u) {
++				wr(hx.se, SE_TX_FIFO, 0);
++				++fed;
++				++pad;
++			}
++			delay(20);
++		}
++		printf("SWEET HMAX: unit L=%u done=%d fed=%u words\n",
++		    len, done, fed);
 +		sweet_log_flush_sync();
-+		return;
++		wr(hx.se, SE_M_CMD_CTRL, M_CMD_CANCEL);
++		hx_wait(2);
++		wr(hx.se, SE_M_CMD_CTRL, M_CMD_ABORT);
++		wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++		hx_wait(10);
 +	}
-+	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+	/* 10-byte write (0x10007f00 <- a99a0000), TRANS_LEN=10: feed words
-+	 * until DONE and COUNT them — bytes (3 words) vs words (10 words)
-+	 * settles the TRANS_LEN unit question in one shot */
-+	wr(hx.se, SE_SPI_TX_TRANS_LEN, 10);
-+	for (unsigned i = 0; i < 3; ++i) {
-+		uint32_t word = 0;
-+		for (unsigned j = 0; j < 4; ++j)
-+			word |= (uint32_t)buf[i * 4u + j] << (8u * j);
-+		wr(hx.se, SE_TX_FIFO, word);
-+	}
-+	wr(hx.se, SE_M_CMD, OP_TX_ONLY << 27);
-+	for (unsigned guard = 0; guard < 400 && !done; ++guard) {
-+		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
-+		if (irq & (1u << 0)) {		/* M_CMD_DONE */
-+			wr(hx.se, SE_M_IRQ_CLEAR, irq);
-+			done = true;
-+			break;
-+		}
-+		if (irq & IRQ_ERR_BITS) {
-+			wr(hx.se, SE_M_IRQ_CLEAR, irq);
-+			printf("SWEET HMAX: probe irq err=%#x at pad %u\n",
-+			    irq, pad);
-+			break;
-+		}
-+		if ((rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC) <
-+		    hx.fifodepth - 2u) {
-+			wr(hx.se, SE_TX_FIFO, 0);
-+			++pad;
-+		}
-+		delay(20);
-+	}
-+	printf("SWEET HMAX: probe tx done=%d pad=%u total=%u words, "
-+	    "st=%#x irq=%#x\n", done, pad, 3u + pad,
-+	    rd(hx.se, SE_GENI_STATUS), rd(hx.se, SE_M_IRQ_STATUS));
-+	sweet_log_flush_sync();
-+	wr(hx.se, SE_M_CMD_CTRL, M_CMD_CANCEL);
-+	hx_wait(2);
-+	wr(hx.se, SE_M_CMD_CTRL, M_CMD_ABORT);
-+	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
 +	hx.dead = false;
-+	bus_reset();
 +}
 +
 +/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM

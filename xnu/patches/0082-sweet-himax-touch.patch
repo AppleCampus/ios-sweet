@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,811 @@
+@@ -0,0 +1,816 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -286,6 +286,9 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	say("se: writing clk_sel/ser");
 +	wr(hx.se, SE_CLK_SEL, 0);
 +	wr(hx.se, SE_SER_M_CLK_CFG, (2u << 4) | 1u);
++	printf("SWEET HMAX: se clk readback sel=%#x ser=%#x\n",
++	    rd(hx.se, SE_CLK_SEL), rd(hx.se, SE_SER_M_CLK_CFG));
++	sweet_log_flush_sync();
 +	say("se clocks ok (clk_sel/ser)");
 +	/* 4 x 8-bit words per FIFO word, MSB-first on the wire */
 +	wr(hx.se, SE_GENI_TX_PACKING_CFG0, 0xc010u);
@@ -319,9 +322,9 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		}
 +		delay(1);
 +	}
-+	printf("SWEET HMAX: m_cmd timeout st=%#x irq=%#x rxst=%#x\n",
++	printf("SWEET HMAX: m_cmd timeout st=%#x irq=%#x txwc=%#x rxst=%#x\n",
 +	    rd(hx.se, SE_GENI_STATUS), rd(hx.se, SE_M_IRQ_STATUS),
-+	    rd(hx.se, SE_RX_FIFO_STATUS));
++	    rd(hx.se, SE_TX_FIFO_STATUS), rd(hx.se, SE_RX_FIFO_STATUS));
 +	sweet_log_flush_sync();
 +	wr(hx.se, SE_M_CMD_CTRL, M_CMD_CANCEL);
 +	hx_wait(2);
@@ -625,10 +628,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +{
 +	uint8_t d4[4];
 +	uint32_t crc = 0xffffffffu;
-+	uint8_t reset55[4] = { 0x55, 0, 0, 0 };
 +
-+	register_write(ZF_ADDR_SYS_RESET, reset55, 4);
-+	say("sys reset done");
 +	say("step: enter safe mode");
 +	if (!enter_safe_mode()) {
 +		printf("SWEET HMAX: safe mode failed\n");
@@ -771,7 +771,12 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	hx_wait(2);
 +	gpio_set(hx.g99, 0, 0, 2, true, true);
 +	hx_wait(2);
-+	say("step: first SPI bus write");
++	say("step: first SPI tx (sys reset)");
++	{
++		uint8_t r55[4] = { 0x55, 0, 0, 0 };
++		register_write(ZF_ADDR_SYS_RESET, r55, 4);
++	}
++	say("sys reset done");
 +	/* bus-alive probe: burst enable + readback (vendor himax_interface_on);
 +	 * the chk values prove whether the IC answers at all */
 +	interface_on();

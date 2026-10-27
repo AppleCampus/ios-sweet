@@ -17,8 +17,8 @@
 +#define QSCRATCH_SS_PHY_CTRL    0x30
 +#define   LANE0_PWR_PRESENT     (1u << 24)
 +
- #define DCTL_RUN_STOP   (1u << 31)
- #define DCTL_CSFTRST    (1u << 30)
+ #define DCTL_RUN_STOP   (1u << 0)
+ #define DCTL_CSFTRST    (1u << 1)
  #define DSTS_DEVCTRLHLT (1u << 22)
 @@ -491,6 +504,18 @@
  	dwc_wr(DALEPENA, 0x3);

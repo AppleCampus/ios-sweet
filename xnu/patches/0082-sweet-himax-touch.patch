@@ -5242,7 +5242,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +};
 --- /dev/null
 +++ b/bsd/dev/sweet_keys_tlmm.c
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,179 @@
 +/*
 + * SWEET TLMM volume keys (RMX1971 / Realme Q, SDM712).
 + *
@@ -5326,21 +5326,26 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +static void
 +keys_thread(void *arg, wait_result_t result)
 +{
-+	int up = k_level(k.up), dn = k_level(k.dn);
++	/* The DT says active-high (<&tlmm 0x18 0x1>) but the hardware reads 1
++	 * at rest and 0 while pressed (bias-disable, pulled up on the board):
++	 * the keys are ACTIVE LOW. Reporting the raw level anyway left a
++	 * permanent "down" after every press, so iOS auto-repeated the volume
++	 * key to the top. pressed = !level. */
++	int up = !k_level(k.up), dn = !k_level(k.dn);
 +	int cand_up = up, cand_dn = dn, n_up = 0, n_dn = 0;
 +	int logged = 0;
 +	uint64_t hold = 0;		/* no new events before this tb tick */
 +
 +	(void)arg;
 +	(void)result;
-+	printf("SWEET KEY2: v2 poll %uus deb %u polling gpio%u/%u, "
-+	    "idle up=%d down=%d\n", K_POLL_US, K_DEBOUNCE,
++	printf("SWEET KEY2: v3 poll %uus deb %u active-low gpio%u/%u, "
++	    "idle pressed up=%d down=%d\n", K_POLL_US, K_DEBOUNCE,
 +	    K_GPIO_UP, K_GPIO_DOWN, up, dn);
 +	sweet_log_flush_sync();
 +
 +	for (;;) {
-+		int s_up = k_level(k.up);
-+		int s_dn = k_level(k.dn);
++		int s_up = !k_level(k.up);
++		int s_dn = !k_level(k.dn);
 +
 +		uint64_t now = ml_get_timebase();
 +

@@ -5422,3 +5422,20 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	k.started = 1;
 +}
 +#endif	/* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -174,8 +174,12 @@ sweet_usb_probe(void)
+ #define QSCRATCH_SS_PHY_CTRL    0x30
+ #define   LANE0_PWR_PRESENT     (1u << 24)
+ 
+-#define DCTL_RUN_STOP   (1u << 31)
+-#define DCTL_CSFTRST    (1u << 30)
++/* DWC3 DCTL layout (GSNPSID 0x5533300a = DWC3 3.30a): RunStop is bit 0
++ * and CSFTRST bit 1. Bits 31/30 are reserved and read back as 0, so the
++ * old "soft reset done after 1 ms" was a no-op: the controller never ran
++ * (DCTL bit0 stayed 0) and every DEPCMD hung with CMDACT still set. */
++#define DCTL_RUN_STOP   (1u << 0)
++#define DCTL_CSFTRST    (1u << 1)
+ #define DSTS_DEVCTRLHLT (1u << 22)
+ 
+ #define DEPCMD_SETEPCONFIG      1

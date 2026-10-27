@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1047 @@
+@@ -0,0 +1,1078 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -245,6 +245,17 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +
 +/* ---- GENI SPI engine ---- */
 +
++/* SE_SPI_CPHA bit0, SE_SPI_CPOL bit2 (spi-geni-qcom.c CPHA/CPOL) */
++static void
++se_mode(unsigned pol, unsigned pha)
++{
++	uint32_t cpha = rd(hx.se, SE_SPI_CPHA);
++	uint32_t cpol = rd(hx.se, SE_SPI_CPOL);
++
++	wr(hx.se, SE_SPI_CPHA, pha ? (cpha | 1u) : (cpha & ~1u));
++	wr(hx.se, SE_SPI_CPOL, pol ? (cpol | 4u) : (cpol & ~4u));
++}
++
 +static bool
 +se_init(void)
 +{
@@ -282,15 +293,16 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_S_IRQ_EN, rd(hx.se, SE_S_IRQ_EN) | M_CMD_DONE);
 +	say("se cfg3 ok (m/s irq en)");
 +
-+	/* spi mode 0 for this stage: mode 3 (vendor's SPI_MODE_3) STALLS the
-+	 * sequencer — commands are accepted and never complete. Revisit once
-+	 * the bus is otherwise proven. */
++	/* SPI mode 3: the vendor driver hard-sets s_client->mode = SPI_MODE_3
++	 * for this panel (hx83112a_noflash.c, in the probe) whatever the DT
++	 * says. mode 0 in every earlier build was a workaround for the
++	 * "commands never complete" stall, which turned out to be the FIFO
++	 * ordering bug — so the IC's real mode has to be retested now. */
 +	wr(hx.se, SE_SPI_LOOPBACK, rd(hx.se, SE_SPI_LOOPBACK) & ~0x3u);
 +	wr(hx.se, SE_SPI_DEMUX_SEL, 0);
-+	wr(hx.se, SE_SPI_CPHA, rd(hx.se, SE_SPI_CPHA) & ~1u);
-+	wr(hx.se, SE_SPI_CPOL, rd(hx.se, SE_SPI_CPOL) & ~0x4u);
++	se_mode(1, 1);
 +	wr(hx.se, SE_SPI_DEMUX_OUTPUT_INV, 0);
-+	say("se spi mode ok (mode0 probe)");
++	say("se spi mode ok (mode3)");
 +	say("se: writing clk_sel/ser");
 +	wr(hx.se, SE_CLK_SEL, 0);
 +	wr(hx.se, SE_SER_M_CLK_CFG, (2u << 4) | 1u);
@@ -583,11 +595,12 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 + * whether or not the touch IC is powered. So this single line answers
 + * "did the FIFO ordering fix work" independently of the power vote.
 + */
-+static void
-+wire_probe(void)
++static int
++ordercheck(unsigned mode)
 +{
 +	static const unsigned lens[2] = { 10, 3 };
 +	uint8_t buf[12];
++	int fails = 0;
 +
 +	for (unsigned i = 0; i < sizeof(buf); ++i)
 +		buf[i] = 0;
@@ -596,15 +609,31 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		uint64_t t0 = ml_get_timebase();
 +		int rc = spi_tx(buf, lens[li]);
 +
-+		printf("SWEET HMAX: ordercheck L=%u rc=%d us=%llu txwc=%#x "
-+		    "st=%#x\n", lens[li], rc,
++		printf("SWEET HMAX: ordercheck m%u L=%u rc=%d us=%llu "
++		    "txwc=%#x st=%#x\n", mode, lens[li], rc,
 +		    (unsigned long long)((ml_get_timebase() - t0) / 19u),
 +		    rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC,
 +		    rd(hx.se, SE_GENI_STATUS));
 +		sweet_log_flush_sync();
-+		if (rc != 0)
++		if (rc != 0) {
++			++fails;
 +			bus_reset();
++		}
 +	}
++	return fails;
++}
++
++static void
++wire_probe(void)
++{
++	if (ordercheck(3) == 0)
++		return;
++	/* mode 3 cannot clock even a host-only transfer: drop to mode 0 so
++	 * the rest of the bring-up still runs, and say so in the log */
++	printf("SWEET HMAX: mode3 unusable -> retry mode0\n");
++	sweet_log_flush_sync();
++	se_mode(0, 0);
++	(void)ordercheck(0);
 +}
 +
 +/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM
@@ -887,8 +916,8 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	(void)PE_parse_boot_argn("sweetmaxdelay", &delay_s, sizeof(delay_s));
 +	/* self-identifying banner: three separate rounds were spent guessing
 +	 * which build was actually running. Never infer it from wording. */
-+	printf("SWEET HMAX: v7 order=issue-then-fill feed=ceil(L/4) "
-+	    "rsc=%#x\n", 0x179e0000u);
++	printf("SWEET HMAX: v8 order=issue-then-fill feed=ceil(L/4) "
++	    "mode=3 rsc=%#x\n", 0x179e0000u);
 +	printf("SWEET HMAX: starting in %u s\n", delay_s);
 +	hx_wait(delay_s * 1000u);
 +
@@ -980,11 +1009,13 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	gpio_set(hx.g125, 0, 3, 3, false, false);	/* irq input, pull-up */
 +	say("step: reset pulse");
 +	hx_wait(50);
-+	/* hardware reset pulse: low 2 ms, high 2 ms (vendor resetgpio_set) */
++	/* hardware reset pulse: low 2 ms, high 2 ms (vendor resetgpio_set
++	 * drives reset high and then msleep(RESET_TO_NORMAL_TIME = 2)); the
++	 * extra 50 ms is the IC's own boot time before it answers SPI */
 +	gpio_set(hx.g99, 0, 0, 2, true, false);
 +	hx_wait(2);
 +	gpio_set(hx.g99, 0, 0, 2, true, true);
-+	hx_wait(2);
++	hx_wait(50);
 +	say("step: first SPI tx (sys reset)");
 +	wire_probe();
 +	{

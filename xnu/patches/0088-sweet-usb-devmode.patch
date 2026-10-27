@@ -1,0 +1,68 @@
+From: SWEET RMX1971 port (ZCode agent + AppleCampus)
+Subject: [PATCH 0088] sweet: DWC3 device role (GCTL.PrtCapDir) before endpoint setup
+
+panic27, first boot with the 0086 reset workaround:
+
+  SWEET USB: soft reset STUCK (continuing) after 100 ms, GCTL 0x00102000->0x00102001 DCTL 0x00f00000 DCFG 0x00080804
+  SWEET USB: ep0 cmd 0x1 timeout
+  SWEET USB: endpoint 0 setup failed
+
+DCTL reads back 0x00f00000, i.e. CSFTRST does clear once it is written with
+the rest of DCTL preserved -- but DEPSTARTCFG/DEPCFG still time out. GCTL
+reads 0x00102000: PrtCapDir (bits 13:12) is 0b10 = OTG, so the core never
+picks the device role and the command interface refuses endpoint commands.
+Set PrtCapDir = device (0b01) together with DSBLCLKGTNG, keep the reset
+attempt short, and continue either way.
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -875,27 +875,29 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+-	/* Core soft reset (DWC3 3.30a). CSFTRST only self-clears while the core
+-	 * clock is running, and GCTL.DSBLCLKGTNG (bit 0) gates it -- ABL leaves
+-	 * that bit 0, which is exactly why bit 1 stayed set for the whole wait.
+-	 * Keep the rest of DCTL instead of writing 0x2 over ABL's 0x00f00000.
+-	 * If it still will not clear, continue anyway: the controller is already
+-	 * halted in device mode with the PHY up, and the event buffer, DCFG,
+-	 * endpoint 0 and RunStop are all reprogrammed below. */
+-	uint32_t gctl0 = dwc_rd(GCTL);
+-	dwc_wr(GCTL, gctl0 | (1u << 0));
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_CSFTRST);
+-	int i;
+-	for (i = 0; i < 100 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
+-	}
+-	bool reset_ok = !(dwc_rd(DCTL) & DCTL_CSFTRST);
+-	if (!reset_ok) {
+-		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_CSFTRST);
+-	}
+-	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x->0x%08x DCTL 0x%08x DCFG 0x%08x\n",
+-	    reset_ok ? "done" : "STUCK (continuing)", i, gctl0, dwc_rd(GCTL),
+-	    dwc_rd(DCTL), dwc_rd(DCFG));
++	/* DWC3 3.30a on SDM712. Two things were wrong here:
++	 *  - GCTL.PrtCapDir (bits 13:12) reads 0b10 = OTG. Every DEPCFG/DEPCMD
++	 *    then hangs with CMDACT set ("ep0 cmd 0x1 timeout") because the
++	 *    core never selects the device role. Force device (0b01).
++	 *  - CSFTRST only self-clears while the core clock runs; GCTL bit 0
++	 *    (DSBLCLKGTNG) gates it and ABL leaves it 0. Disable gating, then
++	 *    reset. If it still will not clear, drop the reset and carry on:
++	 *    ABL already left the core halted with the PHY up, and the event
++	 *    buffer, DCFG, endpoints and RunStop are reprogrammed below. */
++	uint32_t gctl0 = dwc_rd(GCTL);
++	dwc_wr(GCTL, (gctl0 | (1u << 0)) & ~(3u << 12) | (1u << 12));
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_CSFTRST);
++	int i;
++	for (i = 0; i < 20 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	bool reset_ok = !(dwc_rd(DCTL) & DCTL_CSFTRST);
++	if (!reset_ok) {
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_CSFTRST);
++	}
++	printf("SWEET USB: reset %s after %d ms, GCTL 0x%08x->0x%08x DCTL 0x%08x "
++	    "GSTS 0x%08x DCFG 0x%08x\n", reset_ok ? "done" : "skipped", i, gctl0,
++	    dwc_rd(GCTL), dwc_rd(DCTL), dwc_rd(0xc118), dwc_rd(DCFG));
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));

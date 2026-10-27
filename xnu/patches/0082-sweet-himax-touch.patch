@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1053 @@
+@@ -0,0 +1,1047 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -346,24 +346,50 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	return false;
 +}
 +
++/* one FIFO word = 4 bytes of the wire stream, little-endian within the word */
++static void
++tx_word(const uint8_t *tx, unsigned len, unsigned idx)
++{
++	uint32_t word = 0;
++
++	for (unsigned j = 0; j < 4 && (idx * 4u + j) < len; ++j)
++		word |= (uint32_t)tx[idx * 4u + j] << (8u * j);
++	wr(hx.se, SE_TX_FIFO, word);
++}
++
++static unsigned
++fifo_depth(void)
++{
++	return hx.fifodepth ? hx.fifodepth : 16u;
++}
++
 +/*
-+ * One TX-only FIFO message, split into FIFO-sized chunks; CS stays low
-+ * across the whole message (FRAGMENTATION on every m_cmd but the last).
-+ * Pre-fills each chunk, then issues the command (the sequencer waits for
-+ * FIFO data, but pre-fill-then-issue is the safe bare-metal pattern).
-+ */
-+/*
-+ * One non-fragmented TX-only command; the FIFO is refilled while the
-+ * sequencer drains it. Works for any length (the 48 KiB image is a single
-+ * command). M_CMD_DONE fires when TRANS_LEN bytes have been clocked out.
++ * Start one m_cmd and stream the whole message into the TX FIFO.
++ *
++ * THE ORDER IS THE BUG THAT COST 20 ROUNDS. One word has to be staged
++ * before M_CMD (a completely empty FIFO underruns the sequencer), but every
++ * further word must be pushed *after* the command is running — that is what
++ * the vendor driver does: it issues the command and then refills from the
++ * TX-watermark ISR, so in the working driver not a single word is written
++ * ahead of M_CMD. Pre-filling the whole message (what this file did up to
++ * v6) silently drops the staged words: FIFO count reads 0, M_CMD_DONE never
++ * fires, no error bit is ever set, M_GENI_CMD_ACTIVE stays stuck. That is
++ * the st=0x41 / irq=0 / txwc=0 signature of every "command never completes"
++ * log, at any length and any SPI mode.
++ *
++ * ceil(len/4) words is exactly enough — a FIFO word emits its 4 bytes and
++ * the byte counter (TRANS_LEN, GENI_BYTE_GRAN=0 -> 1 byte per count) stops
++ * the stream mid-word. There is no "+1 prefetch": the fed=ceil(L/4)+1 in
++ * the old probe was its poll loop writing one pad word before its first
++ * DONE check, and only the post-issue words were ever actually sent.
 + */
 +static int
-+spi_tx(const uint8_t *tx, unsigned len)
++stream_tx(const uint8_t *tx, unsigned len, uint32_t m_cmd)
 +{
++	unsigned words = (len + 3u) / 4u;
 +	unsigned w = 0;
++	unsigned stall = 0;
 +
-+	if (hx.dead || len == 0)
-+		return EIO;
 +	if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
 +		hx.dead = true;
 +		return EBUSY;
@@ -371,32 +397,40 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
 +	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
 +	wr(hx.se, SE_SPI_TX_TRANS_LEN, len);
-+	/* the engine consumes ceil(len/4) + 1 words (measured: L=4 -> 2 fed,
-+	 * 8 -> 3, 12 -> 4): one prefetch word beyond the math — push it or
-+	 * every command stalls waiting for data (the whole bring-up bug) */
-+	unsigned words = (len + 3u) / 4u + 1u;
-+	while (w < words && w < hx.fifodepth) {
-+		uint32_t word = 0;
-+		for (unsigned j = 0; j < 4 && (w * 4u + j) < len; ++j)
-+			word |= (uint32_t)tx[w * 4u + j] << (8u * j);
-+		wr(hx.se, SE_TX_FIFO, word);
-+		++w;
-+	}
-+	wr(hx.se, SE_M_CMD, OP_TX_ONLY << 27);
++	tx_word(tx, len, w++);			/* stage one, then run */
++	wr(hx.se, SE_M_CMD, m_cmd);
 +	while (w < words) {
-+		unsigned wc = rd(hx.se, SE_TX_FIFO_STATUS) & RX_FIFO_WC_MSK;
-+		if (wc > hx.fifodepth - 2u) {
-+			delay(50);
++		unsigned wc = rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC;
++
++		if (wc > fifo_depth() - 2u) {
++			if (++stall > 2000u) {
++				printf("SWEET HMAX: tx fifo stuck wc=%u "
++				    "fed=%u/%u st=%#x\n", wc, w, words,
++				    rd(hx.se, SE_GENI_STATUS));
++				sweet_log_flush_sync();
++				hx.dead = true;
++				return EIO;
++			}
++			delay(20);		/* engine is draining */
 +			continue;
 +		}
-+		for (unsigned n = hx.fifodepth - 2u - wc; n > 0 && w < words; --n) {
-+			uint32_t word = 0;
-+			for (unsigned j = 0; j < 4 && (w * 4u + j) < len; ++j)
-+				word |= (uint32_t)tx[w * 4u + j] << (8u * j);
-+			wr(hx.se, SE_TX_FIFO, word);
-+			++w;
-+		}
++		stall = 0;
++		tx_word(tx, len, w++);
 +	}
++	return 0;
++}
++
++/*
++ * One non-fragmented TX-only command; the 48 KiB image is a single command.
++ * M_CMD_DONE fires after TRANS_LEN bytes have been clocked out.
++ */
++static int
++spi_tx(const uint8_t *tx, unsigned len)
++{
++	if (hx.dead || len == 0)
++		return EIO;
++	if (stream_tx(tx, len, OP_TX_ONLY << 27) != 0)
++		return EIO;
 +	return m_cmd_wait_done() ? 0 : EIO;
 +}
 +
@@ -404,6 +438,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 + * 56-byte event frame (+ slack). The IC only drives MISO after the command
 + * bytes, so the first three captured bytes are discarded. */
 +static uint8_t hx_rxbuf[3u + HX_EVENT_FRAME + 4u];
++static uint8_t hx_fdtx[3u + HX_EVENT_FRAME + 4u];
 +
 +static bool hx_use_fd;
 +
@@ -434,18 +469,14 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		hx.dead = true;
 +		return EBUSY;
 +	}
-+	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+	wr(hx.se, SE_SPI_TX_TRANS_LEN, total);
++	/* [F3, addr, 00 ...] — the IC drives MISO only after these bytes */
++	for (unsigned i = 0; i < total; ++i)
++		hx_fdtx[i] = 0;
++	hx_fdtx[0] = HX_READ_CMD;
++	hx_fdtx[1] = cmd;
 +	wr(hx.se, SE_SPI_RX_TRANS_LEN, total);
-+	/* +1 prefetch word, measured on hardware (see spi_tx) */
-+	for (unsigned i = 0; i < total + 4u; i += 4) {
-+		uint32_t word = 0;
-+		if (i == 0)
-+			word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
-+		wr(hx.se, SE_TX_FIFO, word);
-+	}
-+	wr(hx.se, SE_M_CMD, OP_FULL_DUPLEX << 27);
++	if (stream_tx(hx_fdtx, total, OP_FULL_DUPLEX << 27) != 0)
++		return EIO;
 +	if (!m_cmd_wait_done()) {
 +		printf("SWEET HMAX: bus_read fd failed\n");
 +		sweet_log_flush_sync();
@@ -487,15 +518,14 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		hx.dead = true;
 +		return EBUSY;
 +	}
-+	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+	wr(hx.se, SE_SPI_TX_TRANS_LEN, 3);
 +	{
-+		uint32_t word = (uint32_t)HX_READ_CMD | ((uint32_t)cmd << 8);
-+		wr(hx.se, SE_TX_FIFO, word);
-+		wr(hx.se, SE_TX_FIFO, 0);	/* the +1 prefetch word */
++		/* 3-byte header fits one FIFO word; the counter stops the
++		 * stream after 3 bytes, so no pad byte reaches the wire */
++		uint8_t hdr[4] = { HX_READ_CMD, cmd, 0, 0 };
++
++		if (stream_tx(hdr, 3, (OP_TX_ONLY << 27) | PARAM_FRAG) != 0)
++			return EIO;
 +	}
-+	wr(hx.se, SE_M_CMD, (OP_TX_ONLY << 27) | PARAM_FRAG);
 +	if (!wait_clear(hx.se, SE_TX_FIFO_STATUS, TX_FIFO_WC)) {
 +		printf("SWEET HMAX: frag tx drain timeout wc=%#x\n",
 +		    rd(hx.se, SE_TX_FIFO_STATUS));
@@ -547,74 +577,34 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +}
 +
 +/*
-+ * Wire-alive probe, bypassing M_CMD_DONE entirely: issue a write and a
-+ * full-duplex readback with FIXED delay pacing. If the IC echoes the
-+ * pattern, the bus and the IC are alive and only the DONE signaling is
-+ * broken (delay-paced flow becomes viable).
++ * v7 sequencer self-check. The two probe lengths are the exact transfers
++ * that used to hang forever (10 = the 2+8 byte sys-reset write, 3 = the
++ * read header), and both are TX-only: M_CMD_DONE fires on the host side
++ * whether or not the touch IC is powered. So this single line answers
++ * "did the FIFO ordering fix work" independently of the power vote.
 + */
 +static void
 +wire_probe(void)
 +{
-+	/* TRANS_LEN unit discriminator: for L in 4/8/12 issue a TX command
-+	 * and feed pad words until DONE. fed==L -> unit is bytes; fed==L/4
-+	 * (rounded) -> unit is 4-byte words. Also time one delay(1000). */
-+	const unsigned lens[3] = { 4, 8, 12 };
-+	uint64_t t0;
++	static const unsigned lens[2] = { 10, 3 };
++	uint8_t buf[12];
 +
-+	t0 = ml_get_timebase();
-+	delay(1000);
-+	printf("SWEET HMAX: delay(1000)=%llu tb-ticks\n",
-+	    (unsigned long long)(ml_get_timebase() - t0));
-+	sweet_log_flush_sync();
++	for (unsigned i = 0; i < sizeof(buf); ++i)
++		buf[i] = 0;
++	buf[0] = 0xF2;
++	for (unsigned li = 0; li < 2; ++li) {
++		uint64_t t0 = ml_get_timebase();
++		int rc = spi_tx(buf, lens[li]);
 +
-+	for (unsigned li = 0; li < 3; ++li) {
-+		unsigned len = lens[li];
-+		unsigned fed = 0, pad = 0;
-+		bool done = false;
-+
-+		if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
-+			printf("SWEET HMAX: probe: bus busy\n");
-+			sweet_log_flush_sync();
-+			return;
-+		}
-+		wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+		wr(hx.se, SE_SPI_TRANS_CFG,
-+		    rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+		wr(hx.se, SE_SPI_TX_TRANS_LEN, len);
-+		wr(hx.se, SE_TX_FIFO, 0x00F20000u);	/* F2 00 00 00 */
-+		++fed;
-+		wr(hx.se, SE_M_CMD, OP_TX_ONLY << 27);
-+		for (unsigned guard = 0; guard < 200 && !done; ++guard) {
-+			uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
-+			if (irq & (1u << 0)) {
-+				wr(hx.se, SE_M_IRQ_CLEAR, irq);
-+				done = true;
-+				break;
-+			}
-+			if (irq & IRQ_ERR_BITS) {
-+				wr(hx.se, SE_M_IRQ_CLEAR, irq);
-+				printf("SWEET HMAX: probe L=%u irq err=%#x "
-+				    "at fed=%u\n", len, irq, fed);
-+				break;
-+			}
-+			if ((rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC) <
-+			    hx.fifodepth - 2u) {
-+				wr(hx.se, SE_TX_FIFO, 0);
-+				++fed;
-+				++pad;
-+			}
-+			delay(20);
-+		}
-+		printf("SWEET HMAX: unit L=%u done=%d fed=%u words\n",
-+		    len, done, fed);
++		printf("SWEET HMAX: ordercheck L=%u rc=%d us=%llu txwc=%#x "
++		    "st=%#x\n", lens[li], rc,
++		    (unsigned long long)((ml_get_timebase() - t0) / 19u),
++		    rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC,
++		    rd(hx.se, SE_GENI_STATUS));
 +		sweet_log_flush_sync();
-+		wr(hx.se, SE_M_CMD_CTRL, M_CMD_CANCEL);
-+		hx_wait(2);
-+		wr(hx.se, SE_M_CMD_CTRL, M_CMD_ABORT);
-+		wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+		hx_wait(10);
++		if (rc != 0)
++			bus_reset();
 +	}
-+	hx.dead = false;
 +}
 +
 +/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM
@@ -895,6 +885,10 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("sweetmaxdelay", &delay_s, sizeof(delay_s));
++	/* self-identifying banner: three separate rounds were spent guessing
++	 * which build was actually running. Never infer it from wording. */
++	printf("SWEET HMAX: v7 order=issue-then-fill feed=ceil(L/4) "
++	    "rsc=%#x\n", 0x179e0000u);
 +	printf("SWEET HMAX: starting in %u s\n", delay_s);
 +	hx_wait(delay_s * 1000u);
 +

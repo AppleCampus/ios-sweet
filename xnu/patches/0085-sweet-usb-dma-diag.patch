@@ -1,0 +1,32 @@
+From: SWEET RMX1971 port (ZCode agent + AppleCampus)
+Subject: [PATCH 0085] sweet: DWC3 DMA diagnostics
+
+The 2026-10-27 boot produced the sweet_usb_probe() register dump but not a
+single line from sweet_usb_gadget_start() -- no "soft reset", no "no DMA
+memory", no "endpoint 0 setup failed" anywhere in the 4 MiB console log --
+while the volume-key driver (same patch, same boot) logged normally. The
+only silent exit in that function is
+
+        ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+        if (!pn) { return; }
+
+so print the allocation address and the translation result before deciding
+whether the DMA area or the pmap lookup is at fault.
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -862,9 +862,14 @@
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET USB: no DMA memory\n");
++		printf("SWEET USB: no DMA memory (%u bytes)\n", (unsigned)UD_SIZE);
+ 		return;
+ 	}
++	printf("SWEET USB: dma va=%#llx size=%#x\n",
++	    (unsigned long long)ud.dma, (unsigned)UD_SIZE);
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+ 	if (!pn) {
++		printf("SWEET USB: pmap_find_phys(va=%#llx) returned 0\n",
++		    (unsigned long long)ud.dma);
+ 		return;
+ 	}
++	printf("SWEET USB: dma pa=%#llx\n", (unsigned long long)ptoa_64(pn));

@@ -5242,7 +5242,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +};
 --- /dev/null
 +++ b/bsd/dev/sweet_keys_tlmm.c
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,174 @@
 +/*
 + * SWEET TLMM volume keys (RMX1971 / Realme Q, SDM712).
 + *
@@ -5275,6 +5275,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t ml_get_timebase(void);
 +extern kern_return_t thread_terminate(thread_t);
 +extern void sweet_hid_key(int key, int down);
 +extern void sweet_log_flush_sync(void);	/* bsd/dev/sweet_ufs.c */

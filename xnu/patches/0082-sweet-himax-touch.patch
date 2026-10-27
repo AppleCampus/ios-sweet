@@ -5242,7 +5242,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +};
 --- /dev/null
 +++ b/bsd/dev/sweet_keys_tlmm.c
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,173 @@
 +/*
 + * SWEET TLMM volume keys (RMX1971 / Realme Q, SDM712).
 + *
@@ -5290,8 +5290,14 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +/* pinctrl-sdm670 config: func 0 (gpio), drive 2, bias-disable, input-enable */
 +#define K_GPIO_CFG	0x80u
 +
-+#define K_POLL_US	20		/* sample period */
-+#define K_DEBOUNCE	3		/* identical samples before a change */
++/* delay() is ~1.14 us per unit on this part (measured: delay(1000) = 21810
++ * tb-ticks at 19.2 MHz), NOT milliseconds. The first version polled every
++ * 20 us with a 3-sample debounce = 70 us, so one mechanical press produced a
++ * burst of press/release pairs and iOS ran the volume to the top. Poll at
++ * ~5 ms and require ~25 ms of stability, then lock out for 150 ms. */
++#define K_POLL_US	4400		/* ~5 ms with the 1.14 us factor */
++#define K_DEBOUNCE	5		/* ~25 ms stable before an edge counts */
++#define K_LOCKOUT_US	150000
 +
 +static struct {
 +	vm_offset_t up, dn;
@@ -5322,10 +5328,12 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	int up = k_level(k.up), dn = k_level(k.dn);
 +	int cand_up = up, cand_dn = dn, n_up = 0, n_dn = 0;
 +	int logged = 0;
++	uint64_t hold = 0;		/* no new events before this tb tick */
 +
 +	(void)arg;
 +	(void)result;
-+	printf("SWEET KEY2: polling gpio%u/%u, idle up=%d down=%d\n",
++	printf("SWEET KEY2: v2 poll %uus deb %u polling gpio%u/%u, "
++	    "idle up=%d down=%d\n", K_POLL_US, K_DEBOUNCE,
 +	    K_GPIO_UP, K_GPIO_DOWN, up, dn);
 +	sweet_log_flush_sync();
 +
@@ -5333,13 +5341,16 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		int s_up = k_level(k.up);
 +		int s_dn = k_level(k.dn);
 +
++		uint64_t now = ml_get_timebase();
++
 +		if (s_up == cand_up) {
 +			n_up = 0;
-+		} else if (++n_up >= K_DEBOUNCE) {
++		} else if (++n_up >= K_DEBOUNCE && now >= hold) {
 +			cand_up = s_up;
 +			n_up = 0;
 +			if (cand_up != up) {
 +				up = cand_up;
++				hold = now + K_LOCKOUT_US * 24u;	/* 19.2 ticks/us */
 +				sweet_hid_key(1, up);
 +				if (logged++ < 32) {
 +					printf("SWEET KEY2: vol up %s\n",
@@ -5350,11 +5361,12 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +		}
 +		if (s_dn == cand_dn) {
 +			n_dn = 0;
-+		} else if (++n_dn >= K_DEBOUNCE) {
++		} else if (++n_dn >= K_DEBOUNCE && now >= hold) {
 +			cand_dn = s_dn;
 +			n_dn = 0;
 +			if (cand_dn != dn) {
 +				dn = cand_dn;
++				hold = now + K_LOCKOUT_US * 24u;	/* 19.2 ticks/us */
 +				sweet_hid_key(2, dn);
 +				if (logged++ < 32) {
 +					printf("SWEET KEY2: vol down %s\n",

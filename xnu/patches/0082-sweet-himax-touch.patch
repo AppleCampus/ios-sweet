@@ -7,31 +7,34 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -110,5 +111,6 @@
+@@ -110,5 +112,7 @@
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
 +bsd/dev/sweet_himax.c			standard
++bsd/dev/sweet_keys_tlmm.c			standard
  bsd/dev/mem.c				standard
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -52,6 +53,7 @@
+@@ -52,6 +54,8 @@
  extern void sweet_sample_start(void);
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
  extern void sweet_usb_probe(void);
 +extern void sweet_himax_init(void);
++extern void sweet_keys_tlmm_init(void);
  
  #define REG_CAP         0x00
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -659,6 +660,7 @@
+@@ -659,6 +661,8 @@
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
  	sweet_touch_init();
  	sweet_usb_probe();
 +	sweet_himax_init();
++	sweet_keys_tlmm_init();
  	return 0;
  }
 --- /dev/null
@@ -5237,3 +5240,167 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 +	0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x53, 0x00, 0x00, 0x00, 0xc1, 0x3e, 0x24, 0x61,
 +};
+--- /dev/null
++++ b/bsd/dev/sweet_keys_tlmm.c
+@@ -0,0 +1,161 @@
++/*
++ * SWEET TLMM volume keys (RMX1971 / Realme Q, SDM712).
++ *
++ * The volume keys on this board are plain TLMM GPIOs, not PMIC keypad
++ * inputs — the live FDT says so:
++ *
++ *   gpio_keys {
++ *           vol_up   { gpios = <&tlmm 0x18 0x1>; ... };   /+ gpio 24, active high +/
++ *           vol_down { gpios = <&tlmm 0x5c 0x1>; ... };   /+ gpio 92, active high +/
++ *   };
++ *
++ * and pinctrl-sdm670.c puts gpio24 in the WEST tile and gpio92 in the SOUTH
++ * tile (NORTH/SOUTH/WEST = 0x500000/0x900000/0x100000, ctl_reg = base +
++ * 0x1000 * id). So both keys can be read with three register accesses and no
++ * PMIC, no SPMI, no rpmh vote — which is why this driver exists before the
++ * power key does: PM660 PON needs SPMI first.
++ *
++ * Level changes go out through sweet_hid_key(key, down) from
++ * iokit/Kernel/arm/hid/SweetHID.cpp (0 power, 1 volume up, 2 volume down).
++ *
++ * Boot args: sweetk2=0 disables (default on).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_log_flush_sync(void);	/* bsd/dev/sweet_ufs.c */
++void sweet_keys_tlmm_init(void);
++
++#define K_TLMM_PA	0x03400000u
++#define K_TILE_WEST	0x00100000u	/* gpio 24  (volume up) */
++#define K_TILE_SOUTH	0x00900000u	/* gpio 92  (volume down) */
++#define K_GPIO_UP	24u
++#define K_GPIO_DOWN	92u
++#define K_GPIO_IO	0x4u		/* io_reg: bit0 = in, bit1 = out */
++#define K_GPIO_PAGE	0x1000u
++/* pinctrl-sdm670 config: func 0 (gpio), drive 2, bias-disable, input-enable */
++#define K_GPIO_CFG	0x80u
++
++#define K_POLL_US	20		/* sample period */
++#define K_DEBOUNCE	3		/* identical samples before a change */
++
++static struct {
++	vm_offset_t up, dn;
++	volatile int started;
++} k;
++
++static inline uint32_t
++k_rd(vm_offset_t base, unsigned off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++k_wr(vm_offset_t base, unsigned off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++}
++
++static int
++k_level(vm_offset_t page)
++{
++	return (k_rd(page, K_GPIO_IO) & 1u) ? 1 : 0;
++}
++
++static void
++keys_thread(void *arg, wait_result_t result)
++{
++	int up = k_level(k.up), dn = k_level(k.dn);
++	int cand_up = up, cand_dn = dn, n_up = 0, n_dn = 0;
++	int logged = 0;
++
++	(void)arg;
++	(void)result;
++	printf("SWEET KEY2: polling gpio%u/%u, idle up=%d down=%d\n",
++	    K_GPIO_UP, K_GPIO_DOWN, up, dn);
++	sweet_log_flush_sync();
++
++	for (;;) {
++		int s_up = k_level(k.up);
++		int s_dn = k_level(k.dn);
++
++		if (s_up == cand_up) {
++			n_up = 0;
++		} else if (++n_up >= K_DEBOUNCE) {
++			cand_up = s_up;
++			n_up = 0;
++			if (cand_up != up) {
++				up = cand_up;
++				sweet_hid_key(1, up);
++				if (logged++ < 32) {
++					printf("SWEET KEY2: vol up %s\n",
++					    up ? "down" : "up");
++					sweet_log_flush_sync();
++				}
++			}
++		}
++		if (s_dn == cand_dn) {
++			n_dn = 0;
++		} else if (++n_dn >= K_DEBOUNCE) {
++			cand_dn = s_dn;
++			n_dn = 0;
++			if (cand_dn != dn) {
++				dn = cand_dn;
++				sweet_hid_key(2, dn);
++				if (logged++ < 32) {
++					printf("SWEET KEY2: vol down %s\n",
++					    dn ? "down" : "up");
++					sweet_log_flush_sync();
++				}
++			}
++		}
++		delay(K_POLL_US);
++	}
++}
++
++void
++sweet_keys_tlmm_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (k.started)
++		return;
++	if (PE_parse_boot_argn("sweetk2", &enabled, sizeof(enabled)) &&
++	    enabled == 0) {
++		printf("SWEET KEY2: disabled (sweetk2=0)\n");
++		return;
++	}
++	/* one 4 KiB page per pin — bigger spans bust kmem_alloc here */
++	k.up = ml_io_map(K_TLMM_PA + K_TILE_WEST + K_GPIO_UP * K_GPIO_PAGE,
++	    K_GPIO_PAGE);
++	k.dn = ml_io_map(K_TLMM_PA + K_TILE_SOUTH + K_GPIO_DOWN * K_GPIO_PAGE,
++	    K_GPIO_PAGE);
++	if (!k.up || !k.dn) {
++		printf("SWEET KEY2: mmio map failed\n");
++		sweet_log_flush_sync();
++		return;
++	}
++	k_wr(k.up, 0, (k_rd(k.up, 0) & ~0x3ffu) | K_GPIO_CFG);
++	k_wr(k.dn, 0, (k_rd(k.dn, 0) & ~0x3ffu) | K_GPIO_CFG);
++	printf("SWEET KEY2: cfg up=%#x dn=%#x\n",
++	    k_rd(k.up, 0), k_rd(k.dn, 0));
++	sweet_log_flush_sync();
++	if (kernel_thread_start(keys_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET KEY2: thread start failed\n");
++		sweet_log_flush_sync();
++		return;
++	}
++	thread_deallocate(thread);
++	k.started = 1;
++}
++#endif	/* ARM64_BOARD_CONFIG_SWEET */

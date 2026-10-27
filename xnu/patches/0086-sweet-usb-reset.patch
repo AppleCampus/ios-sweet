@@ -1,0 +1,56 @@
+From: SWEET RMX1971 port (ZCode agent + AppleCampus)
+Subject: [PATCH 0086] sweet: fix DWC3 core soft reset (CSFTRST never cleared)
+
+The first boot with the DMA diagnostics printed
+
+  SWEET USB: dma va=0xfffffe8fff258000 size=0x4000
+  SWEET USB: dma pa=0x103d74000
+  SWEET USB: soft reset STUCK after 500 ms, GCTL 0x00102000 DCFG 0x00080804
+
+so pmap_find_phys() was never the problem; the controller reset was. DWC3
+CSFTRST only self-clears while the core clock runs and GCTL.DSBLCLKGTNG
+(bit 0) gates it -- ABL leaves that bit 0. Previous code also wrote 0x2
+over the whole of DCTL, dropping ABL's 0x00f00000. Do both properly, then
+continue even if the reset still will not complete, because everything we
+need is reprogrammed right afterwards anyway.
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -875,17 +875,27 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+-	dwc_wr(DCTL, DCTL_CSFTRST);
+-	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
+-	}
+-	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+-	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+-		return;
+-	}
++	/* Core soft reset (DWC3 3.30a). CSFTRST only self-clears while the core
++	 * clock is running, and GCTL.DSBLCLKGTNG (bit 0) gates it -- ABL leaves
++	 * that bit 0, which is exactly why bit 1 stayed set for the whole wait.
++	 * Keep the rest of DCTL instead of writing 0x2 over ABL's 0x00f00000.
++	 * If it still will not clear, continue anyway: the controller is already
++	 * halted in device mode with the PHY up, and the event buffer, DCFG,
++	 * endpoint 0 and RunStop are all reprogrammed below. */
++	uint32_t gctl0 = dwc_rd(GCTL);
++	dwc_wr(GCTL, gctl0 | (1u << 0));
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_CSFTRST);
++	int i;
++	for (i = 0; i < 100 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	bool reset_ok = !(dwc_rd(DCTL) & DCTL_CSFTRST);
++	if (!reset_ok) {
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_CSFTRST);
++	}
++	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x->0x%08x DCTL 0x%08x DCFG 0x%08x\n",
++	    reset_ok ? "done" : "STUCK (continuing)", i, gctl0, dwc_rd(GCTL),
++	    dwc_rd(DCTL), dwc_rd(DCFG));
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));

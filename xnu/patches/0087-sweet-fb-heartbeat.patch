@@ -1,0 +1,76 @@
+From: SWEET RMX1971 port (ZCode agent + AppleCampus)
+Subject: [PATCH 0087] sweet: framebuffer heartbeat + non-blocking swap
+
+panic26 froze the UI inside Settings: the last "SWEET FB: 1000 swaps"
+line is followed by minutes of touch/AKS logging with no 2000-swap
+milestone, i.e. backboardd stopped handing frames to AppleCLCD::swap()
+while the rest of the kernel kept running. Either the vsync timer died
+(CoreAnimation then throttles to zero commits) or swap() blocked on
+fLock, which the vsync callback holds across client->notify(). Make
+swap() non-blocking and print a heartbeat so the next log says which.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -206,6 +206,9 @@
+ 	return true;
+ }
+ 
++static uint64_t sweet_fb_swap_count;
++static uint64_t sweet_fb_swap_drops;
++static uint64_t sweet_fb_alloc_fail;
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -217,6 +217,12 @@
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+ 		0, 0,
+ 	};
++	/* Heartbeat: one line every 600 vsyncs (10 s at 60 Hz) so that a
++	 * frozen UI can be told apart from a dead vsync timer in the log. */
++	if ((count % 600) == 0) {
++		IOLog("SWEET FB: heartbeat vsync %llu swaps %llu dirty %d poweroff %d\n",
++		    count, sweet_fb_swap_count, fb->fDirty ? 1 : 0, fb->fPowerOff ? 1 : 0);
++	}
+ 
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+@@ -250,6 +250,8 @@
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
+ 		}
++		} else if (sweet_fb_alloc_fail++ < 8) {
++			IOLog("SWEET FB: swap record allocation failed\n");
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+@@ -287,7 +287,6 @@
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
+-static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -299,10 +299,19 @@
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+-	IOLockLock(fLock);
+-	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
+-	IOLockUnlock(fLock);
++	/* Never block the compositor here: if the lock is busy (vsync
++	 * callback, or a client method holding it) drop this frame rather
++	 * than deadlock backboardd against the vsync timer. */
++	if (!IOLockTryLock(fLock)) {
++		if (sweet_fb_swap_drops++ < 8) {
++			IOLog("SWEET FB: swap lock busy, frame dropped (%llu)\n",
++			    sweet_fb_swap_count);
++		}
++		return;
++	}
++	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fDirty = true;
++	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}

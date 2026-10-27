@@ -7,34 +7,37 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -110,5 +112,7 @@
+@@ -110,5 +113,8 @@
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
 +bsd/dev/sweet_himax.c			standard
 +bsd/dev/sweet_keys_tlmm.c			standard
++bsd/dev/sweet_pon.c			standard
  bsd/dev/mem.c				standard
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -52,6 +54,8 @@
+@@ -52,6 +55,9 @@
  extern void sweet_sample_start(void);
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
  extern void sweet_usb_probe(void);
 +extern void sweet_himax_init(void);
 +extern void sweet_keys_tlmm_init(void);
++extern void sweet_pon_init(void);
  
  #define REG_CAP         0x00
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -659,6 +661,8 @@
+@@ -659,6 +662,9 @@
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
  	sweet_touch_init();
  	sweet_usb_probe();
 +	sweet_himax_init();
 +	sweet_keys_tlmm_init();
++	sweet_pon_init();
  	return 0;
  }
 --- /dev/null
@@ -5420,6 +5423,289 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	}
 +	thread_deallocate(thread);
 +	k.started = 1;
++}
++#endif	/* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_pon.c
+@@ -0,0 +1,280 @@
++/*
++ * SWEET PM660 power key (RMX1971 / Realme Q, SDM712).
++ *
++ * The power key is NOT a TLMM GPIO on this board: the live FDT puts it on the
++ * PMIC's PON block,
++ *
++ *   qcom,spmi@c440000/qcom,pm660@0/qcom,power-on@800
++ *           compatible = "qcom,qpnp-power-on";
++ *           reg = <0x800 0x100>;
++ *           qcom,pon_1 { qcom,pon-type = <0>; linux,code = <0x74>; };  /+ KEY_POWER +/
++ *
++ * so reading it needs SPMI. That is why the volume keys (plain GPIO 24/92)
++ * worked first: this file is the "SPMI first" part of the plan.
++ *
++ * SPMI access is read-only, through the PMIC arbiter's *observer* channel
++ * (the same lane the battery driver uses, but a different APID). Hardware is
++ * left exactly as XBL programmed it: no writes to the arbiter, no PMIC
++ * config, no interrupt enable. One MMIO store issues a one-byte EXT_READL.
++ *
++ * Register model (vendor drivers/spmi/spmi-pmic-arb.c, arbiter v5):
++ *   core  @0x0c440000  version @0x000, APID->PPID table @0x900 + 4*apid
++ *   obs   @0x0e600000  EE0 window: 0x80 * apid + {CMD 0x00, STATUS 0x08,
++ *                                                  RDATA0 0x18}
++ *   PPID = (sid << 8) | (addr >> 8), low 8 address bits go in the command
++ *   cmd  = (opc << 27) | ((addr & 0xff) << 4) | (bc & 7), opc 1 = EXT_READL
++ *   STATUS bit0 = done, bits1..3 = failure/denied/dropped
++ *
++ * PON_RT_STS (base + 0x10) bit0 is KPDPWR_N and reads 1 while the key is
++ * held (qpnp-power-on.c reports exactly that value as "pressed"), so the
++ * polarity is already handled by the PMIC.
++ *
++ * Level changes go out through sweet_hid_key(0, down) from
++ * iokit/Kernel/arm/hid/SweetHID.cpp, i.e. the HID Consumer "Power" usage,
++ * which is what iOS treats as the side button.
++ *
++ * Boot args: sweetpon=0 disables (default on). Note the PMIC's own long-press
++ * reset is untouched: holding the key for ~10 s still hard-resets the phone.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t ml_get_timebase(void);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_log_flush_sync(void);	/* bsd/dev/sweet_ufs.c */
++void sweet_pon_init(void);
++
++#define P_CORE_PA	0x0c440000u
++#define P_OBS_PA	0x0e600000u
++#define P_CORE_SIZE	0x2000u		/* DT says 0x1100; round up a page */
++#define P_OBS_SIZE	0x10000u	/* EE 0: 512 APIDs * 0x80 */
++#define P_APID_MAX	512u
++#define P_APID_NONE	0xffffu
++
++#define P_PON_PERIPH	0x08u			/* sid 0, base 0x800 */
++#define P_PON_RT_STS	0x0810u			/* base + 0x10 */
++#define P_PON_REASON1	0x0808u			/* base + 0x08 */
++#define P_KPDPWR	(1u << 0)
++
++/* delay() is ~1.14 us per unit here (see sweet_keys_tlmm.c), so 4000 is
++ * about 4.5 ms of polling. The PMIC debounces its own PON input, but
++ * RT_STS is the raw level, so we still ask for 3 stable samples. */
++#define P_POLL_US	4000
++#define P_DEBOUNCE	3
++#define P_LOCKOUT_US	120000
++
++static struct {
++	vm_offset_t core, obs;
++	uint16_t apid;
++	volatile int started;
++	unsigned timeouts, errors, logged;
++} p;
++
++static inline uint32_t
++p_rd(vm_offset_t base, unsigned off)
++{
++	uint32_t value = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++/* One observer transaction on an arbitrary APID. 0 = ok, -1 = failed,
++ * -2 = timed out. */
++static int
++p_read_apid(uint16_t apid, unsigned addr, uint8_t *out)
++{
++	unsigned off = 0x80u * apid;
++	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);	/* EXT_READL, BC=0 */
++
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(p.obs + off) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++
++	for (unsigned i = 0; i < 2000; ++i) {
++		uint32_t status = p_rd(p.obs, off + 0x08u);
++
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				if (p.errors++ < 8) {
++					printf("SWEET PON: SPMI addr=%#x "
++					    "failed status=%#x APID=%u\n",
++					    addr, status, apid);
++					sweet_log_flush_sync();
++				}
++				return -1;
++			}
++			*out = (uint8_t)p_rd(p.obs, off + 0x18u);
++			return 0;
++		}
++		delay(1);
++	}
++	if (p.timeouts++ < 8) {
++		printf("SWEET PON: SPMI addr=%#x timeout APID=%u\n", addr, apid);
++		sweet_log_flush_sync();
++	}
++	return -2;
++}
++
++/* Same thing on the APID picked at init. */
++static int
++p_read(unsigned addr, uint8_t *out)
++{
++	if (p.apid == P_APID_NONE) {
++		return -1;
++	}
++	return p_read_apid(p.apid, addr, out);
++}
++
++/* PPID -> APID, the inverse of the hardware's APID->PPID table. A v5 arbiter
++ * may map one PPID to several APIDs (one per execution environment), and only
++ * the one owned by EE0 (us, DT qcom,ee = <0>) is usable, so try every mapping
++ * and keep the first that completes a real transaction. */
++static uint16_t
++p_pick_apid(unsigned ppid)
++{
++	uint16_t tried[8];
++	unsigned n = 0;
++
++	for (unsigned i = 0; i < P_APID_MAX && n < 8; ++i) {
++		uint32_t map = p_rd(p.core, 0x900u + 4u * i);
++
++		if (map && ((map >> 8) & 0xfffu) == ppid) {
++			tried[n++] = (uint16_t)i;
++		}
++	}
++	if (!n) {
++		return P_APID_NONE;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		uint8_t probe = 0;
++
++		if (p_read_apid(tried[i], P_PON_RT_STS, &probe) == 0) {
++			printf("SWEET PON: %u APID(s) for PPID %u, using %u "
++			    "(rt_sts=%#x)\n", n, ppid, tried[i], probe);
++			return tried[i];
++		}
++	}
++	printf("SWEET PON: %u APID(s) for PPID %u, none usable\n", n, ppid);
++	return P_APID_NONE;
++}
++
++static void
++pon_thread(void *arg, wait_result_t result)
++{
++	int pressed = 0, cand = 0, n = 0;
++	uint64_t hold = 0;
++	int first = 1;
++
++	(void)arg;
++	(void)result;
++
++	for (;;) {
++		uint8_t sts = 0xff;
++		int rc = p_read(P_PON_RT_STS, &sts);
++		int level;
++
++		if (rc != 0) {
++			/* Bus is unhappy: report once, then keep trying slowly. */
++			if (first) {
++				printf("SWEET PON: cannot read PON_RT_STS (%d)\n", rc);
++				sweet_log_flush_sync();
++				first = 0;
++			}
++			delay(P_POLL_US * 10);
++			continue;
++		}
++		if (first) {
++			uint8_t reason = 0;
++			(void)p_read(P_PON_REASON1, &reason);
++			printf("SWEET PON: v1 read-only SPMI, APID=%u RT_STS=%#x "
++			    "reason1=%#x kpdpwr=%d\n", p.apid, sts, reason,
++			    (sts & P_KPDPWR) ? 1 : 0);
++			sweet_log_flush_sync();
++			/* Seed the state so a key already held at boot does not
++			 * produce a spurious edge. */
++			pressed = (sts & P_KPDPWR) ? 1 : 0;
++			cand = pressed;
++			first = 0;
++		}
++
++		level = (sts & P_KPDPWR) ? 1 : 0;
++		uint64_t now = ml_get_timebase();
++
++		if (level == cand) {
++			n = 0;
++		} else if (++n >= P_DEBOUNCE && now >= hold) {
++			cand = level;
++			n = 0;
++			if (cand != pressed) {
++				pressed = cand;
++				hold = now + P_LOCKOUT_US * 24u;	/* 19.2 ticks/us */
++				sweet_hid_key(0, pressed);
++				if (p.logged++ < 24) {
++					printf("SWEET PON: kpdpwr %s (rt_sts=%#x)\n",
++					    pressed ? "down" : "up", sts);
++					sweet_log_flush_sync();
++				}
++			}
++		}
++		delay(P_POLL_US);
++	}
++}
++
++void
++sweet_pon_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (p.started) {
++		return;
++	}
++	if (PE_parse_boot_argn("sweetpon", &enabled, sizeof(enabled)) &&
++	    enabled == 0) {
++		printf("SWEET PON: disabled (sweetpon=0)\n");
++		return;
++	}
++	p.apid = P_APID_NONE;
++	/* Deliberately no IOLockAlloc/kmem_alloc here: sweet_spmi.c's battery
++	 * probe dies silently at IOLockAlloc() this early in boot, so this
++	 * driver keeps every byte of state static. */
++	p.core = ml_io_map(P_CORE_PA, P_CORE_SIZE);
++	p.obs = ml_io_map(P_OBS_PA, P_OBS_SIZE);
++	if (!p.core || !p.obs) {
++		printf("SWEET PON: mmio map failed\n");
++		sweet_log_flush_sync();
++		return;
++	}
++	uint32_t ver = p_rd(p.core, 0x000u);
++	if (ver < 0x50000000u || ver >= 0x70000000u) {
++		printf("SWEET PON: unsupported arbiter version %#x\n", ver);
++		sweet_log_flush_sync();
++		return;
++	}
++	p.apid = p_pick_apid(P_PON_PERIPH);
++	if (p.apid == P_APID_NONE) {
++		printf("SWEET PON: no APID for PPID %#x (arb %#x)\n",
++		    P_PON_PERIPH, ver);
++		sweet_log_flush_sync();
++		return;
++	}
++	printf("SWEET PON: arbiter %#x, PON APID=%u\n", ver, p.apid);
++	sweet_log_flush_sync();
++
++	if (kernel_thread_start(pon_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET PON: thread start failed\n");
++		sweet_log_flush_sync();
++		return;
++	}
++	thread_deallocate(thread);
++	p.started = 1;
 +}
 +#endif	/* ARM64_BOARD_CONFIG_SWEET */
 --- a/bsd/dev/sweet_usb.c

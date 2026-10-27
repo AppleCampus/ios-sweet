@@ -36,7 +36,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_himax.c
-@@ -0,0 +1,1123 @@
+@@ -0,0 +1,1096 @@
 +/*
 + * SWEET Himax HX83112A (RMX1971 / Realme Q, SDM712) touch driver.
 + * GENI SPI master SE0 @0x880000, hardware CS, 9.6 MHz mode 0.
@@ -409,8 +409,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
 +	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
 +	wr(hx.se, SE_SPI_TX_TRANS_LEN, len);
-+	tx_word(tx, len, w++);			/* stage one, then run */
-+	wr(hx.se, SE_M_CMD, m_cmd);
++	wr(hx.se, SE_M_CMD, m_cmd);		/* command first, FIFO after */
 +	while (w < words) {
 +		unsigned wc = rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC;
 +
@@ -596,64 +595,29 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 + * "did the FIFO ordering fix work" independently of the power vote.
 + */
 +/*
-+ * One probe transfer using the ONLY pattern that has ever completed on this
-+ * hardware (old wire_probe, mode 0, L=4/8/12): one word staged, M_CMD, then
-+ * feed one pad word per poll pass with delay(20) between passes.
-+ *
-+ * v8 showed that a failed mode-3 transfer wedges the engine for everything
-+ * that follows (mode 0 included), so each case is isolated by cancel/abort
-+ * and the mode-0 cases always run first.
++ * Probe one transfer through the real path (stream_tx) and report timing.
++ * Every earlier "command never completes" case pre-staged FIFO words before
++ * M_CMD; the numbers in every log are consistent with those words being
++ * dropped (fed = ceil(L/4)+1 in the old probe = exactly the one pre-staged
++ * word that never counted), so the probe now exercises the production path
++ * instead of a bespoke loop.
 + */
 +static int
 +probe_xfer(unsigned mode, unsigned len)
 +{
-+	unsigned fed = 0;
-+	int done = 0;
++	uint8_t buf[16];
++	uint64_t t0;
++	int rc;
 +
-+	if (!wait_clear(hx.se, SE_GENI_STATUS, M_CMD_ACTIVE)) {
-+		printf("SWEET HMAX: probe m%u L=%u: bus busy st=%#x\n",
-+		    mode, len, rd(hx.se, SE_GENI_STATUS));
-+		sweet_log_flush_sync();
-+		return 0;
-+	}
-+	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+	wr(hx.se, SE_SPI_TRANS_CFG, rd(hx.se, SE_SPI_TRANS_CFG) & ~1u);
-+	wr(hx.se, SE_SPI_TX_TRANS_LEN, len);
-+	wr(hx.se, SE_TX_FIFO, 0x00F20000u);	/* F2 00 00 00 */
-+	++fed;
-+	wr(hx.se, SE_M_CMD, OP_TX_ONLY << 27);
-+	for (unsigned guard = 0; guard < 200 && !done; ++guard) {
-+		uint32_t irq = rd(hx.se, SE_M_IRQ_STATUS);
-+
-+		if (irq & M_CMD_DONE) {
-+			wr(hx.se, SE_M_IRQ_CLEAR, irq);
-+			done = 1;
-+			break;
-+		}
-+		if (irq & IRQ_ERR_BITS) {
-+			wr(hx.se, SE_M_IRQ_CLEAR, irq);
-+			printf("SWEET HMAX: probe m%u L=%u irq err=%#x fed=%u\n",
-+			    mode, len, irq, fed);
-+			break;
-+		}
-+		if ((rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC) <
-+		    fifo_depth() - 2u) {
-+			wr(hx.se, SE_TX_FIFO, 0);
-+			++fed;
-+		}
-+		delay(20);
-+	}
-+	printf("SWEET HMAX: probe m%u L=%u done=%d fed=%u st=%#x wc=%#x\n",
-+	    mode, len, done, fed, rd(hx.se, SE_GENI_STATUS),
-+	    rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC);
++	for (unsigned i = 0; i < sizeof(buf); ++i)
++		buf[i] = 0;
++	buf[0] = 0xF2;
++	t0 = ml_get_timebase();
++	rc = spi_tx(buf, len);
++	printf("SWEET HMAX: probe m%u L=%u rc=%d us=%llu\n", mode, len, rc,
++	    (unsigned long long)((ml_get_timebase() - t0) / 19u));
 +	sweet_log_flush_sync();
-+	wr(hx.se, SE_M_CMD_CTRL, M_CMD_CANCEL);
-+	hx_wait(2);
-+	wr(hx.se, SE_M_CMD_CTRL, M_CMD_ABORT);
-+	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
-+	hx_wait(10);
-+	hx.dead = false;
-+	return done;
++	return rc == 0;
 +}
 +
 +static void
@@ -661,24 +625,33 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +{
 +	int m0_10;
 +
-+	/* mode 0 first: it is the only mode that has ever completed a
-+	 * transfer, and a mode-3 failure poisons everything after it */
-+	(void)probe_xfer(0, 4);			/* baseline: must DONE */
-+	(void)probe_xfer(0, 8);			/* second control point */
-+	m0_10 = probe_xfer(0, 10);		/* the sys-reset length */
-+	(void)probe_xfer(0, 3);			/* the read-header length */
++	/* Does a TX FIFO write stick while no command is active? If the count
++	 * reads 0 the words were dropped, which is the whole bring-up story. */
++	wr(hx.se, SE_TX_FIFO, 0x11111111u);
++	wr(hx.se, SE_TX_FIFO, 0x22222222u);
++	printf("SWEET HMAX: idle fifo wc=%u (0 = writes dropped)\n",
++	    rd(hx.se, SE_TX_FIFO_STATUS) & TX_FIFO_WC);
++	sweet_log_flush_sync();
++	wr(hx.se, SE_M_CMD_CTRL, M_CMD_ABORT);
++	wr(hx.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	hx_wait(10);
 +
-+	/* then, last, the panel's real mode: one 4-byte transfer only */
++	/* mode 0 first: a mode-3 failure wedges everything after it */
++	se_mode(0, 0);
++	(void)probe_xfer(0, 4);
++	m0_10 = probe_xfer(0, 10);
++	(void)probe_xfer(0, 3);
++
++	/* then the panel's real mode, last */
 +	se_mode(1, 1);
 +	if (probe_xfer(3, 4)) {
-+		printf("SWEET HMAX: mode3 clocks ok\n");
-+		sweet_log_flush_sync();
-+		return;				/* stay in mode 3 */
++		printf("SWEET HMAX: staying in mode3\n");
++	} else {
++		printf("SWEET HMAX: mode3 dead (m0 L=10 %s)\n",
++		    m0_10 ? "works" : "also dead");
++		se_mode(0, 0);
 +	}
-+	printf("SWEET HMAX: mode3 dead; m0 L=10 %s\n",
-+	    m0_10 ? "works" : "also dead");
 +	sweet_log_flush_sync();
-+	se_mode(0, 0);
 +}
 +
 +/* 0xF2 cmd + up to 4 + 48 KiB payload: the vendor downloads the whole SRAM
@@ -961,7 +934,7 @@ Boot args: sweethimax=1, sweetmaxdelay=N. Default off.
 +	(void)PE_parse_boot_argn("sweetmaxdelay", &delay_s, sizeof(delay_s));
 +	/* self-identifying banner: three separate rounds were spent guessing
 +	 * which build was actually running. Never infer it from wording. */
-+	printf("SWEET HMAX: v9 probe-matrix mode0-first "
++	printf("SWEET HMAX: v10 cmd-first, no pre-stage "
 +	    "rsc=%#x\n", 0x179e0000u);
 +	printf("SWEET HMAX: starting in %u s\n", delay_s);
 +	hx_wait(delay_s * 1000u);
